@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-ETS2 Road Detector Overlay - YOLOP ONNX (macOS Quartz Edition)
+ETS2 Road Detector Overlay - YOLOP ONNX (macOS Optimizado)
 
-Captura la ventana de Euro Truck Simulator 2 por nombre usando macOS Quartz
-(CGWindowList), corre segmentacion YOLOP ONNX y muestra overlay flotante.
-
-Arreglos:
-  - Captura POR VENTANA con Quartz (no coordenadas manuales)
-  - Ventana ajustada al contenido, sin espacios blancos
-  - Colores INTENSOS de segmentacion
-  - FPS contador visible
+Optimizaciones para Apple Silicon:
+  - CoreML Execution Provider (Neural Engine)
+  - Modelo 320x320 (3x mas rapido que 640x640)
+  - Frame skipping (procesa 1 de cada N frames)
+  - Resize agresivo de captura antes de inferencia
 """
 
 import os
@@ -27,7 +24,7 @@ from PIL import Image, ImageTk
 # -----------------------------------------------------------------------------
 # CONFIGURACION
 # -----------------------------------------------------------------------------
-FPS_LIMIT = 25
+FPS_LIMIT = 30
 SHOW_LANES = True
 DISPLAY_MODE = "overlay"   # "overlay" | "mask" | "split"
 
@@ -37,20 +34,28 @@ LANE_ALPHA = 0.9
 COLOR_ROAD = np.array([0, 255, 0], dtype=np.uint8)
 COLOR_LANE = np.array([0, 0, 255], dtype=np.uint8)
 
-MODEL_URL = (
-    "https://raw.githubusercontent.com/hustvl/YOLOP/main/weights/"
-    "yolop-640-640.onnx"
-)
-MODEL_PATH = "weights/yolop-640-640.onnx"
+# Resolucion del modelo. 320 = rapido, 640 = preciso.
+MODEL_RES = 320  # 320 o 640
 
-# Nombres de proceso/ventana que el script busca
+# Procesar 1 de cada N frames (1 = todos, 2 = mitad, 3 = un tercio)
+FRAME_SKIP = 2
+
+# Reducir captura a esta altura antes de mandar al modelo
+# (menos pixeles = inferencia mas rapida)
+CAPTURE_MAX_H = 480
+
 WINDOW_NAMES = ["Euro Truck", "eurotrucks2", "ETS2", "Steam"]
 
+MODEL_URL = (
+    f"https://raw.githubusercontent.com/hustvl/YOLOP/main/weights/"
+    f"yolop-{MODEL_RES}-{MODEL_RES}.onnx"
+)
+MODEL_PATH = f"weights/yolop-{MODEL_RES}-{MODEL_RES}.onnx"
+
 # -----------------------------------------------------------------------------
-# QUARTZ (macOS native) - listar ventanas y capturar por ID
+# QUARTZ (macOS native)
 # -----------------------------------------------------------------------------
 def get_window_list():
-    """Retorna lista de dicts con {id, name, bounds} usando Quartz."""
     try:
         import Quartz
     except ImportError:
@@ -75,9 +80,6 @@ def get_window_list():
 
 
 def find_ets2_window():
-    """Busca la ventana de ETS2 en la lista de Quartz.
-    Filtra fantasmas (0x0) y prioriza la ventana mas grande con nombre exacto.
-    """
     windows = get_window_list()
     candidates = []
     for w in windows:
@@ -95,12 +97,10 @@ def find_ets2_window():
                     "top": int(b.get("Y", 0)),
                     "width": width,
                     "height": height,
-                    "name": w["name"],
                     "area": width * height,
                 })
     if not candidates:
         return None
-    # Priorizar la de mayor area (la ventana principal del juego)
     candidates.sort(key=lambda x: x["area"], reverse=True)
     best = candidates[0]
     return {
@@ -113,13 +113,11 @@ def find_ets2_window():
 
 
 def capture_window_quartz(win_id):
-    """Captura una ventana especifica por su CGWindowID."""
     try:
         import Quartz
     except ImportError:
         return None
     try:
-        # kCGWindowListOptionIncludingWindow | kCGWindowImageBoundsIgnoreFraming
         image = Quartz.CGWindowListCreateImage(
             Quartz.CGRectNull,
             Quartz.kCGWindowListOptionIncludingWindow,
@@ -128,20 +126,16 @@ def capture_window_quartz(win_id):
         )
         if image is None:
             return None
-        # Convertir CGImage a numpy
         width = Quartz.CGImageGetWidth(image)
         height = Quartz.CGImageGetHeight(image)
         bytesperrow = Quartz.CGImageGetBytesPerRow(image)
         cfdata = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(image))
         buf = np.frombuffer(cfdata, dtype=np.uint8)
-        # El formato puede ser BGRA o ARGB segun el espacio de color
-        # CGWindowListCreateImage suele dar BGRA premultiplied
         if bytesperrow == width * 4:
             arr = buf.reshape((height, width, 4))
         else:
             arr = buf[:height * bytesperrow].reshape((height, bytesperrow))
             arr = arr[:, :width * 4].reshape((height, width, 4))
-        # BGRA -> BGR
         return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
     except Exception as e:
         print(f"[WARN] Quartz capture failed: {e}")
@@ -149,7 +143,6 @@ def capture_window_quartz(win_id):
 
 
 def select_region_manual():
-    """Fallback: seleccion manual con OpenCV ROI."""
     import mss
     print("[INFO] Capturando pantalla para seleccion manual...")
     with mss.MSS() as sct:
@@ -176,7 +169,6 @@ def select_region_manual():
 
 
 def capture_fallback(region):
-    """Captura por region con mss (fallback si Quartz no funciona)."""
     import mss
     try:
         with mss.MSS() as sct:
@@ -193,12 +185,12 @@ def ensure_model():
     if os.path.exists(MODEL_PATH):
         return
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    print("[INFO] Descargando modelo YOLOP (~36 MB)...")
+    print(f"[INFO] Descargando modelo YOLOP {MODEL_RES}x{MODEL_RES} (~{ '8' if MODEL_RES==320 else '34' } MB)...")
     urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
     print("[INFO] Modelo guardado.")
 
 
-def _resize_unscale(img, new_shape=(640, 640), color=114):
+def _resize_unscale(img, new_shape, color=114):
     shape = img.shape[:2]
     if isinstance(new_shape, int):
         new_shape = (new_shape, new_shape)
@@ -219,7 +211,7 @@ def _resize_unscale(img, new_shape=(640, 640), color=114):
 def preprocess(frame_bgr):
     height, width = frame_bgr.shape[:2]
     img_rgb = frame_bgr[:, :, ::-1].copy()
-    canvas, r, dw, dh, new_unpad_w, new_unpad_h = _resize_unscale(img_rgb, (640, 640))
+    canvas, r, dw, dh, new_unpad_w, new_unpad_h = _resize_unscale(img_rgb, (MODEL_RES, MODEL_RES))
     img = canvas.copy().astype(np.float32)
     img /= 255.0
     img[:, :, 0] -= 0.485
@@ -247,7 +239,7 @@ def postprocess(da_seg_out, ll_seg_out, meta):
 
 
 # -----------------------------------------------------------------------------
-# OVERLAY TKINTER (siempre encima, sin bordes)
+# OVERLAY TKINTER
 # -----------------------------------------------------------------------------
 class OverlayWindow:
     def __init__(self, win_info, session):
@@ -263,7 +255,6 @@ class OverlayWindow:
         self.root.overrideredirect(True)
         self.root.configure(bg="black", highlightthickness=0)
 
-        # Boton X rojo
         self.btn_close = Button(
             self.root, text="X", command=self.on_close,
             bg="#cc0000", fg="white", font=("Arial", 8, "bold"),
@@ -281,7 +272,6 @@ class OverlayWindow:
             bd=0, padx=4, pady=2,
         )
 
-        # Arrastre
         self.root.bind("<Button-1>", self._start_move)
         self.root.bind("<B1-Motion>", self._on_move)
         self._drag_x = 0
@@ -310,6 +300,9 @@ class OverlayWindow:
         prev_time = time.time()
         frame_count = 0
         fps_display = 0
+        skip_counter = 0
+        last_da_mask = None
+        last_ll_mask = None
 
         while self._running:
             loop_start = time.time()
@@ -327,17 +320,36 @@ class OverlayWindow:
                 time.sleep(0.2)
                 continue
 
-            # ---- INFERENCIA ONNX ----
-            inp, meta = preprocess(frame_bgr)
-            det_out, da_seg_out, ll_seg_out = self.session.run(
-                ["det_out", "drive_area_seg", "lane_line_seg"],
-                {"images": inp},
-            )
-            da_mask, ll_mask = postprocess(da_seg_out, ll_seg_out, meta)
-
-            # ---- CONSTRUIR VISUALIZACION ----
             h, w = frame_bgr.shape[:2]
 
+            # Reducir resolucion de captura ANTES de inferencia
+            if h > CAPTURE_MAX_H:
+                scale = CAPTURE_MAX_H / h
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                h, w = new_h, new_w
+
+            # ---- INFERENCIA CON FRAME SKIPPING ----
+            skip_counter += 1
+            if skip_counter >= FRAME_SKIP:
+                skip_counter = 0
+                inp, meta = preprocess(frame_bgr)
+                det_out, da_seg_out, ll_seg_out = self.session.run(
+                    ["det_out", "drive_area_seg", "lane_line_seg"],
+                    {"images": inp},
+                )
+                last_da_mask, last_ll_mask = postprocess(da_seg_out, ll_seg_out, meta)
+
+            da_mask = last_da_mask
+            ll_mask = last_ll_mask
+
+            if da_mask is None:
+                # Todavia no hay inferencia lista
+                time.sleep(0.05)
+                continue
+
+            # ---- CONSTRUIR VISUALIZACION ----
             if self._display_mode == "mask":
                 result = np.zeros((h, w, 3), dtype=np.uint8)
                 result[da_mask == 1] = COLOR_ROAD
@@ -395,7 +407,6 @@ class OverlayWindow:
         if frame is not None:
             h, w = frame.shape[:2]
 
-            # Escalar para que quepa en pantalla
             max_w = 1440
             max_h = 900
             scale = min(max_w / w, max_h / h, 1.0)
@@ -412,7 +423,7 @@ class OverlayWindow:
             self.lbl_main.configure(image=imgtk)
             self.lbl_main.place(x=0, y=0, width=new_w, height=new_h)
 
-            info_text = f"FPS:{fps} | mode:{self._display_mode} | Arrastra para mover"
+            info_text = f"FPS:{fps} | res:{MODEL_RES} | skip:{FRAME_SKIP} | mode:{self._display_mode}"
             self.lbl_info.configure(text=info_text)
             self.lbl_info.place(x=0, y=new_h, width=new_w, height=18)
 
@@ -434,7 +445,7 @@ class OverlayWindow:
 # -----------------------------------------------------------------------------
 def main():
     print("=" * 60)
-    print("  ETS2 Road Detector Overlay - YOLOP ONNX (Quartz)")
+    print("  ETS2 Road Detector Overlay - YOLOP ONNX (Optimizado)")
     print("=" * 60)
     print()
 
@@ -442,8 +453,12 @@ def main():
 
     print("[INFO] Cargando modelo ONNX...")
     ort.set_default_logger_severity(4)
-    session = ort.InferenceSession(MODEL_PATH)
+
+    providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    session = ort.InferenceSession(MODEL_PATH, providers=providers)
     print(f"[INFO] Modelo listo. Input: {session.get_inputs()[0].shape}")
+    print(f"[INFO] Providers activos: {session.get_providers()}")
+    print(f"[INFO] Config: res={MODEL_RES}, frame_skip={FRAME_SKIP}, capture_max_h={CAPTURE_MAX_H}")
 
     print("[INFO] Buscando ventana de Euro Truck Simulator 2...")
     win_info = find_ets2_window()
@@ -454,7 +469,6 @@ def main():
         print(f"       Size: {win_info['width']}x{win_info['height']}")
     else:
         print("[WARN] No se detecto la ventana automaticamente.")
-        print("       (Quartz no encontro ETS2 en la lista de ventanas)")
         print("[INFO] Usando seleccion manual...")
         win_info = select_region_manual()
 

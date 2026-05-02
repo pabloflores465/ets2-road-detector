@@ -1,32 +1,58 @@
-# ETS2 Road Detector Overlay (macOS Quartz)
+# ETS2 Road Detector Overlay (macOS Optimizado)
 
-Ventana flotante sin bordes que captura **Euro Truck Simulator 2** usando la API nativa **Quartz** de macOS, detecta la carretera en tiempo real con **YOLOP ONNX** y muestra el resultado siempre encima de todo.
+Ventana flotante sin bordes que captura **Euro Truck Simulator 2** usando la API nativa **Quartz** de macOS, detecta la carretera en tiempo real con **YOLOP ONNX** optimizado para **Apple Silicon** y muestra el resultado siempre encima.
 
-![ETS2 Road Detector concepto](https://i.imgur.com/placeholder.png)
+## Optimizaciones incluidas
 
-## Que detecta el modelo
+| Optimizacion | Impacto |
+|-------------|---------|
+| **CoreML Execution Provider** | Usa Apple Neural Engine (ANE) en vez de CPU puro |
+| **Modelo 320x320** | ~3x mas rapido que 640x640 con perdida minima de precision |
+| **Frame skipping** | Procesa 1 de cada N frames, reutiliza mascara anterior |
+| **Resize previo** | Reduce captura antes de inferencia |
 
-- **Area transitable (carretera)** → **verde brillante**
-- **Lineas de carril** → **rojo**
+## Que detecta
+
+- **Carretera transitable** → verde
+- **Lineas de carril** → rojo
 
 ## Modos de visualizacion
 
-Edita la constante `DISPLAY_MODE` al inicio de `road_detector.py`:
+Edita `DISPLAY_MODE` en `road_detector.py`:
 
 | Modo | Descripcion |
 |------|-------------|
-| `"overlay"` | Imagen original + deteccion coloreada encima (default) |
-| `"mask"` | Solo la segmentacion: negro con verde/rojo |
-| `"split"` | Mitad original (izq) + mitad con deteccion (der) |
+| `"overlay"` | Original + deteccion coloreada (default) |
+| `"mask"` | Solo segmentacion (negro + verde/rojo) |
+| `"split"` | Mitad original, mitad deteccion |
+
+## Configuracion de rendimiento
+
+Edita estas constantes al inicio de `road_detector.py`:
+
+| Parametro | Descripcion | Default | Opciones |
+|-----------|-------------|---------|----------|
+| `MODEL_RES` | Resolucion del modelo | `320` | `320` (rapido) o `640` (preciso) |
+| `FRAME_SKIP` | Procesar 1 de cada N frames | `2` | `1` (todos), `2`, `3`... |
+| `CAPTURE_MAX_H` | Altura maxima de captura | `480` | Bajar = mas rapido |
+| `ROAD_ALPHA` | Intensidad verde | `0.7` | `0.0` - `1.0` |
+| `LANE_ALPHA` | Intensidad rojo | `0.9` | `0.0` - `1.0` |
+
+**Recomendacion para maximo FPS:**
+```python
+MODEL_RES = 320
+FRAME_SKIP = 2
+CAPTURE_MAX_H = 360
+```
 
 ## Requisitos
 
-- **macOS** (Intel o Apple Silicon)
-- Python 3.9+ (preinstalado en macOS)
+- **macOS** con Apple Silicon (M1/M2/M3) o Intel
+- Python 3.9+
 - **Euro Truck Simulator 2 abierto**
-- **Permiso de Grabacion de pantalla** para la Terminal
+- **Permiso de Grabacion de pantalla** para Terminal
 
-## Instalacion rapida
+## Instalacion
 
 ```bash
 cd ets2_road_detector
@@ -34,85 +60,40 @@ chmod +x run.sh
 ./run.sh
 ```
 
-El script crea automaticamente un entorno virtual, instala dependencias, descarga el modelo YOLOP (~36 MB) y lanza el detector.
+## Permisos en macOS
 
-## Uso
+### Grabacion de pantalla (obligatorio)
 
-1. Abre **Euro Truck Simulator 2**.
-2. Ejecuta `./run.sh`.
-3. El script **detecta automaticamente** la ventana del juego via Quartz.
-4. Aparece una ventana **flotante y sin bordes** siempre encima.
-5. **Arrastra** la ventana para moverla donde quieras.
-6. Presiona el boton **X** rojo para cerrar.
+1. **Preferencias del Sistema > Privacidad y Seguridad > Grabacion de pantalla**
+2. Activa tu terminal (**Terminal**, **iTerm2**, **VS Code**)
+3. **Reinicia la terminal**
 
-### Si falla la auto-deteccion
-
-Si Quartz no encuentra el juego, el script muestra la captura de pantalla completa y te pide que **arrastres** para seleccionar la ventana de ETS2 manualmente.
-
-## Como funciona la captura
-
-El script usa **Quartz** (API nativa de macOS) para:
-1. Listar todas las ventanas del sistema
-2. Encontrar la de ETS2 por nombre (`Euro Truck`, `eurotrucks2`, `ETS2`, `Steam`)
-3. Capturar **solo esa ventana** por su CGWindowID
-4. Filtrar ventanas fantasmas (tamaño 0x0) y quedarse con la mas grande
-
-## Permisos en macOS (muy importante)
-
-### Grabacion de pantalla
-
-La primera vez que ejecutes, macOS bloqueara la captura.
-
-1. Ve a **Preferencias del Sistema > Privacidad y Seguridad > Grabacion de pantalla**.
-2. Activa el interruptor junto a tu terminal (**Terminal**, **iTerm2**, **VS Code**, etc.).
-3. **Reinicia la terminal** para que surta efecto.
-
-Sin este permiso, la ventana saldra negra o vacia.
-
-## Configuracion
-
-Edita `road_detector.py` para ajustar:
-
-| Parametro | Descripcion | Default |
-|-----------|-------------|---------|
-| `DISPLAY_MODE` | `"overlay"`, `"mask"` o `"split"` | `"overlay"` |
-| `ROAD_ALPHA` | Intensidad del area verde (0.0-1.0) | `0.7` |
-| `LANE_ALPHA` | Intensidad de las lineas rojas (0.0-1.0) | `0.9` |
-| `FPS_LIMIT` | Maximo FPS para no saturar CPU | `25` |
-| `SHOW_LANES` | Mostrar lineas de carril | `True` |
-| `WINDOW_NAMES` | Nombres de proceso a buscar | `["Euro Truck", ...]` |
+Sin este permiso la ventana sale negra.
 
 ## Solucion de problemas
 
-| Problema | Causa | Solucion |
-|----------|-------|----------|
-| Ventana negra / vacia | Sin permiso de Grabacion de pantalla | Ve a Preferencias del Sistema > Privacidad > Grabacion de pantalla |
-| "No se detecto la ventana" | El juego usa nombre de proceso raro | Edita `WINDOW_NAMES` en el codigo |
-| FPS muy bajos (~1-5) | YOLOP ONNX es pesado en CPU | Cierra apps pesadas, baja resolucion del juego |
-| Colores muy tenues | Alpha muy bajo | Sube `ROAD_ALPHA` y `LANE_ALPHA` a `1.0` |
-| Captura descuadrada | Wine/Steam con bordes invisibles | Usa seleccion manual al iniciar |
+| Problema | Solucion |
+|----------|----------|
+| CPU al 90% | Verifica que diga `CoreMLExecutionProvider` al iniciar. Si dice `CPUExecutionProvider`, reinstala: `pip install --upgrade --force-reinstall onnxruntime` |
+| FPS muy bajos | Baja `MODEL_RES` a `320`, sube `FRAME_SKIP` a `2` o `3`, baja `CAPTURE_MAX_H` a `360` |
+| Ventana negra | Falta permiso de Grabacion de pantalla |
+| Colores tenues | Sube `ROAD_ALPHA` y `LANE_ALPHA` a `1.0` |
+| No detecta ventana | Edita `WINDOW_NAMES` en el codigo |
 
-## Estructura del proyecto
+## Estructura
 
 ```
 ets2_road_detector/
-├── run.sh                      # Lanzador automatico
-├── requirements.txt            # Dependencias
-├── road_detector.py            # Detector principal
-├── weights/
-│   └── yolop-640-640.onnx     # Modelo YOLOP (~34 MB)
-└── venv/                       # Entorno virtual Python
+├── run.sh              # Lanzador
+├── requirements.txt    # Dependencias
+├── road_detector.py    # Detector principal
+├── .gitignore
+├── README.md
+└── weights/
+    └── yolop-320-320.onnx   # Se descarga solo al ejecutar
 ```
 
-## Desinstalacion
+## Creditos
 
-Borra la carpeta completa:
-```bash
-rm -rf /Users/pabloflores/Documents/robotics/ets2_road_detector
-```
-
-## Notas tecnicas
-
-- El modelo YOLOP ONNX corre en **CPU** (no requiere GPU).
-- La captura via Quartz es **nativa de macOS**, no usa librerias de terceros para screenshot.
-- La ventana overlay usa `tkinter` con `-topmost` para estar siempre encima.
+- Modelo [YOLOP](https://github.com/hustvl/YOLOP) por hustvl
+- ONNX Runtime con [CoreML EP](https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html)
