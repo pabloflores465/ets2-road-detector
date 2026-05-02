@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+ETS2 Road Detector Overlay - YOLOP ONNX (macOS Quartz Edition)
+
+Captura la ventana de Euro Truck Simulator 2 por nombre usando macOS Quartz
+(CGWindowList), corre segmentacion YOLOP ONNX y muestra overlay flotante.
+
+Arreglos:
+  - Captura POR VENTANA con Quartz (no coordenadas manuales)
+  - Ventana ajustada al contenido, sin espacios blancos
+  - Colores INTENSOS de segmentacion
+  - FPS contador visible
+"""
+
+import os
+import threading
+import time
+import tkinter as tk
+from tkinter import Label, Button
+import urllib.request
+
+import cv2
+import numpy as np
+import onnxruntime as ort
+from PIL import Image, ImageTk
+
+# -----------------------------------------------------------------------------
+# CONFIGURACION
+# -----------------------------------------------------------------------------
+FPS_LIMIT = 25
+SHOW_LANES = True
+DISPLAY_MODE = "overlay"   # "overlay" | "mask" | "split"
+
+ROAD_ALPHA = 0.7
+LANE_ALPHA = 0.9
+
+COLOR_ROAD = np.array([0, 255, 0], dtype=np.uint8)
+COLOR_LANE = np.array([0, 0, 255], dtype=np.uint8)
+
+MODEL_URL = (
+    "https://raw.githubusercontent.com/hustvl/YOLOP/main/weights/"
+    "yolop-640-640.onnx"
+)
+MODEL_PATH = "weights/yolop-640-640.onnx"
+
+# Nombres de proceso/ventana que el script busca
+WINDOW_NAMES = ["Euro Truck", "eurotrucks2", "ETS2", "Steam"]
+
+# -----------------------------------------------------------------------------
+# QUARTZ (macOS native) - listar ventanas y capturar por ID
+# -----------------------------------------------------------------------------
+def get_window_list():
+    """Retorna lista de dicts con {id, name, bounds} usando Quartz."""
+    try:
+        import Quartz
+    except ImportError:
+        return []
+    window_list = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionAll,
+        Quartz.kCGNullWindowID
+    )
+    result = []
+    for win in window_list:
+        win_id = win.get(Quartz.kCGWindowNumber, 0)
+        owner = win.get(Quartz.kCGWindowOwnerName, "")
+        name = win.get(Quartz.kCGWindowName, "")
+        bounds = win.get(Quartz.kCGWindowBounds, {})
+        result.append({
+            "id": win_id,
+            "owner": owner,
+            "name": name,
+            "bounds": bounds,
+        })
+    return result
+
+
+def find_ets2_window():
+    """Busca la ventana de ETS2 en la lista de Quartz.
+    Filtra fantasmas (0x0) y prioriza la ventana mas grande con nombre exacto.
+    """
+    windows = get_window_list()
+    candidates = []
+    for w in windows:
+        full_text = f"{w['owner']} {w['name']}".lower()
+        for target in WINDOW_NAMES:
+            if target.lower() in full_text:
+                b = w["bounds"]
+                width = int(b.get("Width", 0))
+                height = int(b.get("Height", 0))
+                if width < 200 or height < 150:
+                    continue
+                candidates.append({
+                    "id": w["id"],
+                    "left": int(b.get("X", 0)),
+                    "top": int(b.get("Y", 0)),
+                    "width": width,
+                    "height": height,
+                    "name": w["name"],
+                    "area": width * height,
+                })
+    if not candidates:
+        return None
+    # Priorizar la de mayor area (la ventana principal del juego)
+    candidates.sort(key=lambda x: x["area"], reverse=True)
+    best = candidates[0]
+    return {
+        "id": best["id"],
+        "left": best["left"],
+        "top": best["top"],
+        "width": best["width"],
+        "height": best["height"],
+    }
+
+
+def capture_window_quartz(win_id):
+    """Captura una ventana especifica por su CGWindowID."""
+    try:
+        import Quartz
+    except ImportError:
+        return None
+    try:
+        # kCGWindowListOptionIncludingWindow | kCGWindowImageBoundsIgnoreFraming
+        image = Quartz.CGWindowListCreateImage(
+            Quartz.CGRectNull,
+            Quartz.kCGWindowListOptionIncludingWindow,
+            win_id,
+            Quartz.kCGWindowImageBoundsIgnoreFraming
+        )
+        if image is None:
+            return None
+        # Convertir CGImage a numpy
+        width = Quartz.CGImageGetWidth(image)
+        height = Quartz.CGImageGetHeight(image)
+        bytesperrow = Quartz.CGImageGetBytesPerRow(image)
+        cfdata = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(image))
+        buf = np.frombuffer(cfdata, dtype=np.uint8)
+        # El formato puede ser BGRA o ARGB segun el espacio de color
+        # CGWindowListCreateImage suele dar BGRA premultiplied
+        if bytesperrow == width * 4:
+            arr = buf.reshape((height, width, 4))
+        else:
+            arr = buf[:height * bytesperrow].reshape((height, bytesperrow))
+            arr = arr[:, :width * 4].reshape((height, width, 4))
+        # BGRA -> BGR
+        return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+    except Exception as e:
+        print(f"[WARN] Quartz capture failed: {e}")
+        return None
+
+
+def select_region_manual():
+    """Fallback: seleccion manual con OpenCV ROI."""
+    import mss
+    print("[INFO] Capturando pantalla para seleccion manual...")
+    with mss.MSS() as sct:
+        mon = sct.monitors[1]
+        screenshot = np.array(sct.grab(mon))
+        frame = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
+    print("[INFO] Arrastra para seleccionar la ventana de ETS2.")
+    print("       ESPACIO/ENTER = confirmar | C = cancelar")
+    roi = cv2.selectROI("Selecciona ventana ETS2", frame, fromCenter=False, showCrosshair=True)
+    cv2.destroyWindow("Selecciona ventana ETS2")
+    x, y, w, h = roi
+    if w == 0 or h == 0:
+        print("[ERROR] No se selecciono region.")
+        exit(1)
+    with mss.MSS() as sct:
+        mon = sct.monitors[1]
+    return {
+        "id": None,
+        "left": int(x + mon["left"]),
+        "top": int(y + mon["top"]),
+        "width": int(w),
+        "height": int(h),
+    }
+
+
+def capture_fallback(region):
+    """Captura por region con mss (fallback si Quartz no funciona)."""
+    import mss
+    try:
+        with mss.MSS() as sct:
+            img = sct.grab(region)
+            return cv2.cvtColor(np.array(img), cv2.COLOR_BGRA2BGR)
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------------------
+# MODELO YOLOP
+# -----------------------------------------------------------------------------
+def ensure_model():
+    if os.path.exists(MODEL_PATH):
+        return
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    print("[INFO] Descargando modelo YOLOP (~36 MB)...")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print("[INFO] Modelo guardado.")
+
+
+def _resize_unscale(img, new_shape=(640, 640), color=114):
+    shape = img.shape[:2]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+    canvas = np.zeros((new_shape[0], new_shape[1], 3), dtype=np.float32)
+    canvas.fill(color)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    new_unpad_w, new_unpad_h = new_unpad
+    pad_w, pad_h = new_shape[1] - new_unpad_w, new_shape[0] - new_unpad_h
+    dw = pad_w // 2
+    dh = pad_h // 2
+    if shape[::-1] != new_unpad:
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_AREA)
+    canvas[dh:dh + new_unpad_h, dw:dw + new_unpad_w, :] = img
+    return canvas, r, dw, dh, new_unpad_w, new_unpad_h
+
+
+def preprocess(frame_bgr):
+    height, width = frame_bgr.shape[:2]
+    img_rgb = frame_bgr[:, :, ::-1].copy()
+    canvas, r, dw, dh, new_unpad_w, new_unpad_h = _resize_unscale(img_rgb, (640, 640))
+    img = canvas.copy().astype(np.float32)
+    img /= 255.0
+    img[:, :, 0] -= 0.485
+    img[:, :, 1] -= 0.456
+    img[:, :, 2] -= 0.406
+    img[:, :, 0] /= 0.229
+    img[:, :, 1] /= 0.224
+    img[:, :, 2] /= 0.225
+    img = img.transpose(2, 0, 1)
+    img = np.expand_dims(img, 0)
+    return img, (height, width, r, dw, dh, new_unpad_w, new_unpad_h)
+
+
+def postprocess(da_seg_out, ll_seg_out, meta):
+    height, width, r, dw, dh, new_unpad_w, new_unpad_h = meta
+    da = da_seg_out[:, :, dh:dh + new_unpad_h, dw:dw + new_unpad_w]
+    ll = ll_seg_out[:, :, dh:dh + new_unpad_h, dw:dw + new_unpad_w]
+    da_mask = np.argmax(da, axis=1)[0]
+    ll_mask = np.argmax(ll, axis=1)[0]
+    da_mask = cv2.resize(da_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
+    ll_mask = cv2.resize(ll_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
+    da_mask = (da_mask > 0.5).astype(np.uint8)
+    ll_mask = (ll_mask > 0.5).astype(np.uint8)
+    return da_mask, ll_mask
+
+
+# -----------------------------------------------------------------------------
+# OVERLAY TKINTER (siempre encima, sin bordes)
+# -----------------------------------------------------------------------------
+class OverlayWindow:
+    def __init__(self, win_info, session):
+        self.win_info = win_info
+        self.session = session
+        self._win_lock = threading.Lock()
+        self._running = True
+        self._display_mode = DISPLAY_MODE
+
+        self.root = tk.Tk()
+        self.root.title("ETS2 Road Detection")
+        self.root.attributes("-topmost", True)
+        self.root.overrideredirect(True)
+        self.root.configure(bg="black", highlightthickness=0)
+
+        # Boton X rojo
+        self.btn_close = Button(
+            self.root, text="X", command=self.on_close,
+            bg="#cc0000", fg="white", font=("Arial", 8, "bold"),
+            bd=0, padx=5, pady=1, cursor="hand2"
+        )
+        self.btn_close.place(x=0, y=0)
+
+        self.lbl_main = Label(self.root, bg="black", bd=0)
+        self.lbl_main.place(x=0, y=0)
+
+        self.lbl_info = Label(
+            self.root,
+            text="Iniciando...",
+            fg="#00ff00", bg="black", font=("Courier", 9),
+            bd=0, padx=4, pady=2,
+        )
+
+        # Arrastre
+        self.root.bind("<Button-1>", self._start_move)
+        self.root.bind("<B1-Motion>", self._on_move)
+        self._drag_x = 0
+        self._drag_y = 0
+
+        self.frame_result = None
+        self.fps = 0
+        self._lock = threading.Lock()
+
+        self.thread_capture = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread_capture.start()
+
+        self._schedule_update()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _start_move(self, event):
+        self._drag_x = event.x
+        self._drag_y = event.y
+
+    def _on_move(self, event):
+        x = self.root.winfo_x() + event.x - self._drag_x
+        y = self.root.winfo_y() + event.y - self._drag_y
+        self.root.geometry(f"+{x}+{y}")
+
+    def _capture_loop(self):
+        prev_time = time.time()
+        frame_count = 0
+        fps_display = 0
+
+        while self._running:
+            loop_start = time.time()
+
+            with self._win_lock:
+                info = dict(self.win_info)
+
+            # ---- CAPTURA ----
+            if info.get("id"):
+                frame_bgr = capture_window_quartz(info["id"])
+            else:
+                frame_bgr = capture_fallback(info)
+
+            if frame_bgr is None:
+                time.sleep(0.2)
+                continue
+
+            # ---- INFERENCIA ONNX ----
+            inp, meta = preprocess(frame_bgr)
+            det_out, da_seg_out, ll_seg_out = self.session.run(
+                ["det_out", "drive_area_seg", "lane_line_seg"],
+                {"images": inp},
+            )
+            da_mask, ll_mask = postprocess(da_seg_out, ll_seg_out, meta)
+
+            # ---- CONSTRUIR VISUALIZACION ----
+            h, w = frame_bgr.shape[:2]
+
+            if self._display_mode == "mask":
+                result = np.zeros((h, w, 3), dtype=np.uint8)
+                result[da_mask == 1] = COLOR_ROAD
+                if SHOW_LANES:
+                    result[ll_mask == 1] = COLOR_LANE
+
+            elif self._display_mode == "split":
+                result = frame_bgr.copy()
+                mid = w // 2
+                overlay = np.zeros_like(result)
+                overlay[da_mask == 1] = COLOR_ROAD
+                if SHOW_LANES:
+                    overlay[ll_mask == 1] = COLOR_LANE
+                right = cv2.addWeighted(result[:, mid:, :], 1.0, overlay[:, mid:, :], ROAD_ALPHA, 0)
+                result[:, mid:, :] = right
+
+            else:  # overlay
+                overlay = np.zeros_like(frame_bgr)
+                overlay[da_mask == 1] = COLOR_ROAD
+                if SHOW_LANES:
+                    overlay[ll_mask == 1] = COLOR_LANE
+                result = cv2.addWeighted(frame_bgr, 1.0, overlay, ROAD_ALPHA, 0)
+                if SHOW_LANES:
+                    lane_only = np.zeros_like(frame_bgr)
+                    lane_only[ll_mask == 1] = COLOR_LANE
+                    result = cv2.addWeighted(result, 1.0, lane_only, LANE_ALPHA, 0)
+
+            # ---- FPS ----
+            frame_count += 1
+            now = time.time()
+            if now - prev_time >= 1.0:
+                fps_display = frame_count
+                frame_count = 0
+                prev_time = now
+
+            with self._lock:
+                self.frame_result = result
+                self.fps = fps_display
+
+            elapsed = time.time() - loop_start
+            sleep_time = max(0, (1.0 / FPS_LIMIT) - elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _schedule_update(self):
+        self.root.after(25, self._update_gui)
+
+    def _update_gui(self):
+        if not self._running:
+            return
+        with self._lock:
+            frame = self.frame_result.copy() if self.frame_result is not None else None
+            fps = self.fps
+
+        if frame is not None:
+            h, w = frame.shape[:2]
+
+            # Escalar para que quepa en pantalla
+            max_w = 1440
+            max_h = 900
+            scale = min(max_w / w, max_h / h, 1.0)
+            if scale < 1.0:
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                new_w, new_h = w, h
+
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.lbl_main.imgtk = imgtk
+            self.lbl_main.configure(image=imgtk)
+            self.lbl_main.place(x=0, y=0, width=new_w, height=new_h)
+
+            info_text = f"FPS:{fps} | mode:{self._display_mode} | Arrastra para mover"
+            self.lbl_info.configure(text=info_text)
+            self.lbl_info.place(x=0, y=new_h, width=new_w, height=18)
+
+            self.root.geometry(f"{new_w}x{new_h + 18}")
+            self.btn_close.place(x=new_w - 22, y=0)
+
+        self._schedule_update()
+
+    def on_close(self):
+        self._running = False
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+def main():
+    print("=" * 60)
+    print("  ETS2 Road Detector Overlay - YOLOP ONNX (Quartz)")
+    print("=" * 60)
+    print()
+
+    ensure_model()
+
+    print("[INFO] Cargando modelo ONNX...")
+    ort.set_default_logger_severity(4)
+    session = ort.InferenceSession(MODEL_PATH)
+    print(f"[INFO] Modelo listo. Input: {session.get_inputs()[0].shape}")
+
+    print("[INFO] Buscando ventana de Euro Truck Simulator 2...")
+    win_info = find_ets2_window()
+    if win_info:
+        print(f"[INFO] Ventana detectada:")
+        print(f"       ID: {win_info['id']}")
+        print(f"       Pos: ({win_info['left']}, {win_info['top']})")
+        print(f"       Size: {win_info['width']}x{win_info['height']}")
+    else:
+        print("[WARN] No se detecto la ventana automaticamente.")
+        print("       (Quartz no encontro ETS2 en la lista de ventanas)")
+        print("[INFO] Usando seleccion manual...")
+        win_info = select_region_manual()
+
+    print("[INFO] Iniciando overlay flotante...")
+    overlay = OverlayWindow(win_info, session)
+    overlay.run()
+    print("[INFO] Cerrado.")
+
+
+if __name__ == "__main__":
+    main()
