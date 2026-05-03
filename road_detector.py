@@ -28,8 +28,8 @@ FPS_LIMIT = 30
 SHOW_LANES = True
 DISPLAY_MODE = "overlay"   # "overlay" | "mask" | "split"
 
-ROAD_ALPHA = 0.7
-LANE_ALPHA = 0.9
+ROAD_ALPHA = 1.0
+LANE_ALPHA = 1.0
 
 COLOR_ROAD = np.array([0, 255, 0], dtype=np.uint8)
 COLOR_LANE = np.array([0, 0, 255], dtype=np.uint8)
@@ -233,8 +233,8 @@ def postprocess(da_seg_out, ll_seg_out, meta):
     ll_mask = np.argmax(ll, axis=1)[0]
     da_mask = cv2.resize(da_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
     ll_mask = cv2.resize(ll_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
-    da_mask = (da_mask > 0.5).astype(np.uint8)
-    ll_mask = (ll_mask > 0.5).astype(np.uint8)
+    da_mask = (da_mask > 0.3).astype(np.uint8)
+    ll_mask = (ll_mask > 0.3).astype(np.uint8)
     return da_mask, ll_mask
 
 
@@ -376,15 +376,17 @@ class OverlayWindow:
                 result[:, mid:, :] = right
 
             else:  # overlay
-                overlay = np.zeros_like(frame_bgr)
-                overlay[da_mask == 1] = COLOR_ROAD
+                result = frame_bgr.copy()
+                # Carretera en verde opaco
+                result[da_mask == 1] = COLOR_ROAD
+                # Lineas en rojo opaco
                 if SHOW_LANES:
-                    overlay[ll_mask == 1] = COLOR_LANE
-                result = cv2.addWeighted(frame_bgr, 1.0, overlay, ROAD_ALPHA, 0)
-                if SHOW_LANES:
-                    lane_only = np.zeros_like(frame_bgr)
-                    lane_only[ll_mask == 1] = COLOR_LANE
-                    result = cv2.addWeighted(result, 1.0, lane_only, LANE_ALPHA, 0)
+                    result[ll_mask == 1] = COLOR_LANE
+
+            # Si no detecta nada, mostrar aviso en la imagen
+            if np.sum(da_mask) == 0 and np.sum(ll_mask) == 0:
+                cv2.putText(result, "NO DETECTA", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
             # ---- FPS ----
             frame_count += 1
@@ -432,7 +434,9 @@ class OverlayWindow:
             self.lbl_main.configure(image=imgtk)
             self.lbl_main.place(x=0, y=0, width=new_w, height=new_h)
 
-            info_text = f"FPS:{fps} | res:{MODEL_RES} | skip:{FRAME_SKIP} | mode:{self._display_mode}"
+            road_pixels = int(np.sum(da_mask)) if da_mask is not None else 0
+            lane_pixels = int(np.sum(ll_mask)) if ll_mask is not None else 0
+            info_text = f"FPS:{fps} | res:{MODEL_RES} | road:{road_pixels}px | lane:{lane_pixels}px"
             self.lbl_info.configure(text=info_text)
             self.lbl_info.place(x=0, y=new_h, width=new_w, height=18)
 
