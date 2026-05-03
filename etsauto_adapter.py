@@ -255,42 +255,56 @@ class ETSAutoLaneDetector:
         }
 
 
-# ── Pure Pursuit Controller ──
+# ── Keyboard Lane Controller ──
 
-class PurePursuit:
-    """Geometric controller for lane following."""
+class KeyboardLaneController:
+    """
+    Controller optimized for digital keyboard input.
+    Instead of computing a steering angle (for analog joystick),
+    computes a lateral offset error and returns a direct [-1, 1] command.
+    """
 
     def __init__(self):
-        self.ld = 20.0  # lookahead distance
-        self.lf = 3.63  # lookahead offset
-        self.wheelbase = 8.0  # wheelbase
+        self.lookahead_near = 10.0   # meters
+        self.lookahead_far = 25.0    # meters
+        self.wheelbase = 8.0
 
-    def run(self, trajectory, speed):
+    def run(self, line_m, speed_ms):
         """
         Args:
-            trajectory: Nx2 array of (x, y) points in meters
-            speed: current speed (km/h)
+            line_m: Nx2 array of (x, y) lane center points in meters
+            speed_ms: current speed in m/s
         Returns:
-            steering angle in radians
+            steer command in [-1, 1]
         """
-        if trajectory is None or len(trajectory) < 40:
+        if line_m is None or len(line_m) < 20:
             return 0.0
 
-        # Adjust lookahead based on speed
-        self.ld = 1.0 * speed + self.lf
+        # Find points at lookahead distances
+        near_idx = np.argmin(np.abs(line_m[:, 0] - self.lookahead_near))
+        far_idx = np.argmin(np.abs(line_m[:, 0] - self.lookahead_far))
 
-        # Vehicle state (rear axle)
-        robot_state = np.array([-self.wheelbase, 0.0])
+        # Lateral offset (positive = lane center is to the RIGHT of vehicle)
+        near_offset = line_m[near_idx, 1]
+        far_offset = line_m[far_idx, 1]
 
-        # Target point on trajectory (ahead)
-        target = np.average(trajectory[30:40], axis=0)
+        # Heading error: angle of lane center relative to vehicle heading
+        # Approximate as slope between near and far points
+        dx = line_m[far_idx, 0] - line_m[near_idx, 0]
+        dy = line_m[far_idx, 1] - line_m[near_idx, 1]
+        heading_error = math.atan2(dy, dx) if dx > 0.5 else 0.0
 
-        dy = target[0] - robot_state[0]
-        dx = target[1] - robot_state[1]
+        # Combined error for keyboard control
+        # Lateral offset dominates (we want to center in lane)
+        # Heading error adds anticipation for curves
+        # Negative because: if lane is to the right (offset > 0), we need to steer right (positive)
+        error = near_offset * 0.8 + heading_error * 3.0
 
-        alpha = np.arctan(dx / (dy + 1e-6))
-        ang = math.atan2(2.0 * self.wheelbase * math.sin(alpha), self.ld)
-        return ang
+        # Clamp to [-1, 1] with dead zone for straight roads
+        if abs(error) < 0.05:
+            return 0.0
+        steer = np.clip(error, -1.0, 1.0)
+        return float(steer)
 
 
 # ── Main Interface ──
@@ -303,7 +317,7 @@ class ETSAutoAdapter:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found: {model_path}. Download from ETSAuto releases.")
         self.detector = ETSAutoLaneDetector(model_path)
-        self.controller = PurePursuit()
+        self.controller = KeyboardLaneController()
 
     def process(self, frame_bgr, speed_kmh=50.0):
         """
@@ -316,12 +330,9 @@ class ETSAutoAdapter:
         if line_m is None:
             return 0.0, 0.0, {"status": "no_lanes"}
 
-        # Pure pursuit expects m/s, not km/h
+        # Controller expects m/s
         speed_ms = speed_kmh / 3.6
-        ang_rad = self.controller.run(line_m, speed_ms)
-
-        # Normalize to -1..1 (typical range ±0.4 rad)
-        steer = float(np.clip(ang_rad / 0.4, -1.0, 1.0))
+        steer = self.controller.run(line_m, speed_ms)
 
         # Throttle based on curve
         if abs(steer) > 0.3:
@@ -334,7 +345,7 @@ class ETSAutoAdapter:
         info = {
             "status": "ok",
             "steer": round(steer, 3),
-            "angle_rad": round(ang_rad, 3),
+            "near_offset": round(float(line_m[min(20, len(line_m)-1), 1]), 3) if len(line_m) > 10 else None,
             "throttle": throttle,
             "has_left": lanes["line_l"] is not None,
             "has_right": lanes["line_r"] is not None,

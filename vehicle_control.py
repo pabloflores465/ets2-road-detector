@@ -97,7 +97,7 @@ class VehicleController:
                 time.sleep(sleep)
 
     def _apply_axis(self, name, value, neg_key, pos_key):
-        dead = 0.03
+        dead = 0.01
         abs_val = abs(value)
 
         if abs_val < dead:

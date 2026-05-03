@@ -64,6 +64,7 @@ class Autopilot:
         self._status_info = {}
         self._log_every = 15
         self._recover_timer = 0
+        self._lost_frames = 0
 
     def toggle(self):
         self.enabled = not self.enabled
@@ -117,7 +118,7 @@ class Autopilot:
                 print("[AP] RECOVER done")
                 self.state = "ACTIVE"
         elif lane_info.get("status") != "ok":
-            self._lost_frames = getattr(self, '_lost_frames', 0) + 1
+            self._lost_frames += 1
             if self._lost_frames > 60:
                 self.state = "RECOVER"
                 self._recover_timer = 90
