@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-ETS2 Road Detector Overlay - YOLOP ONNX (macOS Optimizado)
+ETS2 Road Detector Overlay - YOLOP ONNX (macOS)
 
-Optimizaciones para Apple Silicon:
-  - CoreML Execution Provider (Neural Engine)
-  - Modelo 320x320 (3x mas rapido que 640x640)
-  - Frame skipping (procesa 1 de cada N frames)
-  - Resize agresivo de captura antes de inferencia
+Usa modelo YOLOP 640x640 para detectar carretera y carriles en ETS2.
+Captura la ventana especifica del juego via Quartz y muestra overlay flotante.
 """
 
 import os
@@ -35,7 +32,7 @@ COLOR_ROAD = np.array([0, 255, 0], dtype=np.uint8)
 COLOR_LANE = np.array([0, 0, 255], dtype=np.uint8)
 
 # Resolucion del modelo. 320 = rapido, 640 = preciso.
-MODEL_RES = 320  # 320 o 640
+MODEL_RES = 640  # 640 detecta mucho mejor en ETS2
 
 # Procesar 1 de cada N frames (1 = todos, 2 = mitad, 3 = un tercio)
 FRAME_SKIP = 2
@@ -44,7 +41,9 @@ FRAME_SKIP = 2
 # (menos pixeles = inferencia mas rapida)
 CAPTURE_MAX_H = 480
 
-WINDOW_NAMES = ["Euro Truck", "eurotrucks2", "ETS2", "Steam"]
+# Ventanas a buscar, en orden de prioridad.
+# Primero intenta nombres exactos de ETS2; Steam es ultimo recurso.
+WINDOW_NAMES = ["Euro Truck Simulator 2", "Euro Truck", "eurotrucks2", "ETS2"]
 
 MODEL_URL = (
     f"https://raw.githubusercontent.com/hustvl/YOLOP/main/weights/"
@@ -80,36 +79,27 @@ def get_window_list():
 
 
 def find_ets2_window():
+    """Busca ETS2 respetando el orden de prioridad en WINDOW_NAMES."""
     windows = get_window_list()
-    candidates = []
-    for w in windows:
-        full_text = f"{w['owner']} {w['name']}".lower()
-        for target in WINDOW_NAMES:
-            if target.lower() in full_text:
+    for target in WINDOW_NAMES:
+        target_lower = target.lower()
+        for w in windows:
+            full_text = f"{w['owner']} {w['name']}".lower()
+            if target_lower in full_text:
                 b = w["bounds"]
                 width = int(b.get("Width", 0))
                 height = int(b.get("Height", 0))
                 if width < 200 or height < 150:
                     continue
-                candidates.append({
+                print(f"[INFO] Ventana ETS2 encontrada: '{w['owner']}' / '{w['name']}' ({width}x{height})")
+                return {
                     "id": w["id"],
                     "left": int(b.get("X", 0)),
                     "top": int(b.get("Y", 0)),
                     "width": width,
                     "height": height,
-                    "area": width * height,
-                })
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x["area"], reverse=True)
-    best = candidates[0]
-    return {
-        "id": best["id"],
-        "left": best["left"],
-        "top": best["top"],
-        "width": best["width"],
-        "height": best["height"],
-    }
+                }
+    return None
 
 
 def capture_window_quartz(win_id):
