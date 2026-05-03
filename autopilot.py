@@ -124,6 +124,9 @@ class ObstacleAssessor:
             x1, y1, x2, y2, label, score = det
             if label not in self.DANGEROUS:
                 continue
+            # Stricter threshold for person (lots of false positives in ETS2)
+            if label == "person" and score < 0.55:
+                continue
             if score < 0.35:
                 continue
 
@@ -234,20 +237,20 @@ class Autopilot:
         self.obstacle_assessor = ObstacleAssessor()
         self.gps_nav = GPSNavigator()
 
-        # Rate limiters
-        self.steer_limiter = RateLimiter(max_delta_per_cycle=0.12)
-        self.throttle_limiter = RateLimiter(max_delta_per_cycle=0.06)
+        # Rate limiters: faster response (reach 1.0 in ~4 cycles = 0.13s)
+        self.steer_limiter = RateLimiter(max_delta_per_cycle=0.25)
+        self.throttle_limiter = RateLimiter(max_delta_per_cycle=0.25)
 
-        # PID lateral
-        self.kp_steer = 1.60
-        self.ki_steer = 0.025
-        self.kd_steer = 0.35
+        # PID lateral: pure P+D for now, I causes windup with laggy keyboard
+        self.kp_steer = 2.00
+        self.ki_steer = 0.0
+        self.kd_steer = 0.30
         self._steer_integral = 0.0
         self.prev_steer_error = 0.0
 
         # Speed control
-        self.kp_speed = 0.015
-        self.target_speed = 65.0   # faster on straights
+        self.kp_speed = 0.020
+        self.target_speed = 65.0
         self.min_speed = 0.0
         self.max_speed = 85.0
 
@@ -364,18 +367,12 @@ class Autopilot:
         if lane_center is not None:
             error = (lane_center - w / 2.0) / (w / 2.0 + 1e-6)
 
-            # Tight dead zone: ignore tiny jitter but catch small drifts
+            # Tight dead zone
             if abs(error) < 0.008:
                 error = 0.0
 
-            # Integral with anti-windup
-            self._steer_integral += error * dt
-            self._steer_integral = np.clip(self._steer_integral, -0.30, 0.30)
-
             derivative = (error - self.prev_steer_error) / max(dt, 0.001)
-            steer = (self.kp_steer * error +
-                     self.ki_steer * self._steer_integral +
-                     self.kd_steer * derivative)
+            steer = self.kp_steer * error + self.kd_steer * derivative
             self.prev_steer_error = error
             self._lost_lane_frames = 0
         else:
@@ -419,7 +416,7 @@ class Autopilot:
         # ── Smooth & Apply ──
         smooth_steer = self.steer_limiter.update(steer)
 
-        if self.state in ("RECOVER", "EMERGENCY") or obstacle_brake > 0.85:
+        if self.state == "RECOVER":
             smooth_throttle = throttle
             self.throttle_limiter.reset(throttle)
         else:
