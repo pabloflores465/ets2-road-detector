@@ -334,6 +334,10 @@ class ETSAutoAdapter:
         speed_ms = speed_kmh / 3.6
         steer = self.controller.run(line_m, speed_ms)
 
+        # Debug: show lateral offset at 10m
+        near_y = float(line_m[min(20, len(line_m)-1), 1]) if len(line_m) > 20 else 0.0
+        print(f"[ETSAuto] off={near_y:+.2f}m steer={steer:+.2f} L={lanes['line_l'] is not None} R={lanes['line_r'] is not None}")
+
         # Throttle based on curve
         if abs(steer) > 0.3:
             throttle = 0.7
@@ -345,7 +349,7 @@ class ETSAutoAdapter:
         info = {
             "status": "ok",
             "steer": round(steer, 3),
-            "near_offset": round(float(line_m[min(20, len(line_m)-1), 1]), 3) if len(line_m) > 10 else None,
+            "near_offset": round(near_y, 3),
             "throttle": throttle,
             "has_left": lanes["line_l"] is not None,
             "has_right": lanes["line_r"] is not None,
