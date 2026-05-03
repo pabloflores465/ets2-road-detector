@@ -17,3 +17,7 @@ build/
 
 # Modelo ONNX (se descarga automaticamente al ejecutar)
 weights/*.onnx
+
+edgetpu_runtime/
+edgetpu_runtime_*.zip
+*.tar.gz
