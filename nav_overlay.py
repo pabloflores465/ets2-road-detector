@@ -248,6 +248,7 @@ class NavOverlayManager:
         self.thread.start()
 
         self._schedule_update()
+        self._force_topmost()
 
     def _start_move(self, event):
         self._drag_x = event.x
@@ -376,6 +377,17 @@ class NavOverlayManager:
             self.btn_close.place(x=total_w - 20, y=0)
 
         self._schedule_update()
+
+    def _force_topmost(self):
+        """Mantiene la ventana siempre encima de todo (incluso juegos)."""
+        if not self._running:
+            return
+        try:
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.root.after(500, self._force_topmost)
 
     def on_close(self):
         self._running = False

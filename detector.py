@@ -289,6 +289,9 @@ class MainWindow:
         self.frame = tk.Frame(root, bg="black")
         self.frame.pack(fill=tk.BOTH, expand=True)
 
+        # Forzar siempre encima periodicamente
+        self._force_topmost()
+
         self.btn_close = Button(
             self.frame, text="X", command=self.on_close,
             bg="#cc0000", fg="white", font=("Arial", 8, "bold"),
@@ -567,6 +570,17 @@ class MainWindow:
             self.btn_close.place(x=new_w - 22, y=0)
 
         self._schedule_update()
+
+    def _force_topmost(self):
+        """Mantiene la ventana siempre encima de todo (incluso juegos)."""
+        if not self._running:
+            return
+        try:
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.root.after(500, self._force_topmost)
 
     def on_close(self):
         self._running = False
