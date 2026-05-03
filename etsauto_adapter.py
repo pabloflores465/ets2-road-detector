@@ -127,6 +127,10 @@ class ETSAutoLaneDetector:
         import onnxruntime as ort
         self.session = ort.InferenceSession(onnx_path, providers=["CoreMLExecutionProvider", "CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
+        # Get output names by index (safer than assuming order)
+        outputs = self.session.get_outputs()
+        self.output_names = [o.name for o in outputs]
+        print(f"[ETSAuto] Model outputs: {self.output_names}")
 
         self.input_shape = (320, 480)
         self.x_range = (0, 80)
@@ -140,10 +144,16 @@ class ETSAutoLaneDetector:
 
     def preprocess(self, img):
         """img: BGR frame from ETS2"""
-        # ETSAuto crops top 50 pixels (sky)
-        img = img[50:640, :, :]
+        h, w = img.shape[:2]
+        # ETSAuto crops top ~8% of height (sky). For variable input sizes,
+        # use proportional crop. Also account for macOS title bar (~22px).
+        crop_top = min(int(h * 0.08), 50)  # top 8% or max 50px
+        crop_bottom = min(int(h * 0.85), int(h * 0.85))  # bottom 15% is dashboard
+        img = img[crop_top:crop_bottom, :, :]
         img = cv2.resize(img, (self.input_shape[1], self.input_shape[0]))
-        # Normalize (ImageNet)
+        # Convert BGR to RGB (model trained on RGB)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # Normalize (ImageNet) - Albumentations style
         img = img.astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -152,9 +162,16 @@ class ETSAutoLaneDetector:
 
     def infer(self, img_bgr):
         input_tensor = self.preprocess(img_bgr)
-        seg, embedding, offset_y, z_pred = self.session.run(
-            None, {self.input_name: input_tensor}
-        )
+        # Run inference and map outputs by name
+        outputs = self.session.run(self.output_names, {self.input_name: input_tensor})
+        output_dict = dict(zip(self.output_names, outputs))
+
+        # Map to expected names (ETSAuto model may have different order)
+        seg = output_dict.get('seg', outputs[0])
+        embedding = output_dict.get('embedding', outputs[1])
+        offset_y = output_dict.get('offset_y', outputs[2])
+        z_pred = output_dict.get('z_pred', outputs[3])
+
         offset_y = sigmoid(offset_y)
 
         # Cluster embeddings to get lane instances

@@ -63,8 +63,15 @@ def main():
 
     # Inference
     sess = ort.InferenceSession("etsauto_models/bevlanedet.onnx", providers=["CoreMLExecutionProvider", "CPUExecutionProvider"])
-    out = sess.run(None, {sess.get_inputs()[0].name: pre})
-    seg, emb, offset_y, z_pred = out
+    output_names = [o.name for o in sess.get_outputs()]
+    print(f"[TEST] Output names: {output_names}")
+    out = sess.run(output_names, {sess.get_inputs()[0].name: pre})
+    out_dict = dict(zip(output_names, out))
+
+    seg = out_dict.get('seg', out[0])
+    emb = out_dict.get('embedding', out[1])
+    offset_y = out_dict.get('offset_y', out[2])
+    z_pred = out_dict.get('z_pred', out[3])
 
     print(f"[TEST] seg: {seg.shape} range=[{seg.min():.3f}, {seg.max():.3f}]")
 
@@ -72,6 +79,7 @@ def main():
     seg_sig = sigmoid(seg[0, 0])
     print(f"[TEST] seg sigmoid: range=[{seg_sig.min():.3f}, {seg_sig.max():.3f}], mean={seg_sig.mean():.3f}")
     print(f"[TEST] seg > 0.5: {(seg_sig > 0.5).sum()} pixels")
+    print(f"[TEST] seg > 0.1: {(seg_sig > 0.1).sum()} pixels")
 
     # Save seg visualization
     cv2.imwrite("test_seg.jpg", (seg_sig * 255).astype(np.uint8))
