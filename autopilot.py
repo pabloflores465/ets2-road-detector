@@ -3,16 +3,11 @@ autopilot.py
 Autonomous driving stack for Euro Truck Simulator 2.
 
 Architecture:
-  Perception   ->  World Model  ->  Planning  ->  Control
-  (YOLOP lanes, Coral objects, GPS minimap)  ->  (Lane keep, Path follow, Obstacle avoid)  ->  (PWM keys)
-
-Control strategy:
-  - Steering is a blend of short-term lane-keeping (70%) and long-term GPS heading (30%).
-  - Throttle uses a target-speed follower with obstacle feed-forward braking.
-  - All outputs are smoothed with rate-limiters to avoid jerky inputs.
+  Perception -> World Model -> Planning -> Control
+  (YOLOP lanes, Coral objects, GPS minimap) -> (Lane keep, Path follow, Obstacle avoid) -> (PWM keys)
 """
 import time
-import math
+import collections
 import cv2
 import numpy as np
 from vehicle_control import VehicleController
@@ -24,50 +19,44 @@ from vehicle_control import VehicleController
 class LaneAnalyzer:
     """Extract lane geometry from YOLOP ll_seg output."""
 
-    def __init__(self, lane_width_ratio: float = 0.45):
-        # Expected lane width as ratio of image width (at bottom of crop)
+    def __init__(self, lane_width_ratio: float = 0.35):
         self.lane_width_ratio = lane_width_ratio
         self.prev_center = None
         self.prev_heading = 0.0
+        self._width_history = collections.deque(maxlen=20)
+        self._center_history = collections.deque(maxlen=10)
+
+    def _estimated_lane_width(self, img_width: int):
+        if self._width_history:
+            return float(np.median(self._width_history))
+        # Conservative default for ETS2 at ~480p capture
+        return img_width * 0.28
 
     def analyze(self, ll_seg, img_width: int, img_height: int):
-        """
-        Args:
-            ll_seg: YOLOP lane-line output, shape (1, 2, H, W) float32
-            img_width: original capture width (for scale)
-            img_height: original capture height
-        Returns:
-            lane_center_x (pixels in original frame) or None,
-            lane_heading  (normalized -1..1, positive = turning right),
-            lane_width_px (estimated)
-        """
         if ll_seg is None or ll_seg.size == 0:
-            print("[LANE] ll_seg is None/empty")
             return self.prev_center, self.prev_heading, None
 
-        # ll_seg[0,1] = lane-line probability map
         prob = ll_seg[0, 1, :, :]
         h, w = prob.shape
         scale_x = img_width / w
         scale_y = img_height / h
-
-        print(f"[LANE] ll_seg shape={ll_seg.shape}, prob map shape={prob.shape}, max_prob={float(np.max(prob)):.3f}")
 
         # Sample rows in bottom half (closer to truck)
         y_ratios = [0.55, 0.65, 0.75, 0.85, 0.92]
         centers = []
         left_xs = []
         right_xs = []
+        widths = []
 
         mid = w // 2
-        gap = int(w * 0.06)  # min gap from center to avoid hood noise
+        gap = int(w * 0.05)
 
         for yr in y_ratios:
             y = int(h * yr)
             if y >= h:
                 continue
             row = prob[y, :]
-            xs = np.where(row > 0.45)[0]
+            xs = np.where(row > 0.40)[0]
             if len(xs) < 3:
                 continue
 
@@ -77,40 +66,47 @@ class LaneAnalyzer:
             if len(left) > 0 and len(right) > 0:
                 lx = float(np.median(left))
                 rx = float(np.median(right))
+                cw = (rx - lx) * scale_x
                 centers.append(((lx + rx) / 2.0) * scale_x)
                 left_xs.append(lx * scale_x)
                 right_xs.append(rx * scale_x)
+                widths.append(cw)
             elif len(right) > 0:
                 rx = float(np.median(right))
-                centers.append((rx - w * self.lane_width_ratio / 2) * scale_x)
+                ew = self._estimated_lane_width(img_width)
+                centers.append((rx * scale_x) - ew / 2)
                 right_xs.append(rx * scale_x)
             elif len(left) > 0:
                 lx = float(np.median(left))
-                centers.append((lx + w * self.lane_width_ratio / 2) * scale_x)
+                ew = self._estimated_lane_width(img_width)
+                centers.append((lx * scale_x) + ew / 2)
                 left_xs.append(lx * scale_x)
 
         if not centers:
-            print(f"[LANE] No lane centers found (checked {len(y_ratios)} rows)")
             return self.prev_center, self.prev_heading, None
 
         lane_center = float(np.median(centers))
-        lane_width = None
-        if left_xs and right_xs:
-            lane_width = float(np.median(right_xs) - np.median(left_xs))
 
-        # Heading: slope between top and bottom center points
+        # Update width history when we saw both lines
+        if widths:
+            self._width_history.append(float(np.median(widths)))
+
+        lane_width = self._estimated_lane_width(img_width)
+
+        # Smooth center with history to reduce jitter
+        self._center_history.append(lane_center)
+        lane_center = float(np.median(self._center_history))
+
+        # Heading from top vs bottom center drift
         heading = 0.0
         if len(centers) >= 2:
-            # Use top-most and bottom-most samples
             dy = (y_ratios[-1] - y_ratios[0]) * h * scale_y
             dx = centers[-1] - centers[0]
             if abs(dy) > 1:
-                # Normalize: dx per 100 px of forward distance
                 heading = np.clip(dx / (dy + 1e-6), -1.0, 1.0)
 
         self.prev_center = lane_center
         self.prev_heading = heading
-        print(f"[LANE] center={lane_center:.1f} heading={heading:.3f} width={lane_width}")
         return lane_center, heading, lane_width
 
 
@@ -118,16 +114,9 @@ class LaneAnalyzer:
 # Obstacle Assessor
 # ───────────────────────────────
 class ObstacleAssessor:
-    """Turn Coral detections into brake/throttle recommendations."""
-
     DANGEROUS = {"car", "truck", "bus", "person", "motorcycle", "bicycle"}
 
     def assess(self, detections, img_h: int, img_w: int):
-        """
-        Returns:
-            brake_intensity: 0.0 (free road) to 1.0 (emergency stop)
-            closest_dist_ratio: 0 = far, 1 = imminent collision
-        """
         if not detections:
             return 0.0, 0.0
 
@@ -138,31 +127,27 @@ class ObstacleAssessor:
             x1, y1, x2, y2, label, score = det
             if label not in self.DANGEROUS:
                 continue
-            if score < 0.4:
+            if score < 0.35:
                 continue
 
-            # Distance proxy: bottom edge of bbox (y2). Lower in image = closer.
-            dist_ratio = y2 / img_h  # 0 = top/far, 1 = bottom/close
+            dist_ratio = y2 / img_h
             dist_ratio = max(0.0, min(1.0, dist_ratio))
-
-            # In-lane: horizontal center near image center
             cx = (x1 + x2) / 2.0
-            in_lane = abs(cx - img_w / 2.0) < (img_w * 0.32)
+            in_lane = abs(cx - img_w / 2.0) < (img_w * 0.34)
 
-            if not in_lane and dist_ratio < 0.75:
-                # Adjacent lane, not too close -> ignore
+            if not in_lane and dist_ratio < 0.70:
                 continue
 
-            # Risk curve: exponential near collision
-            risk = dist_ratio ** 2.5
+            # Stronger risk curve: brake hard when object is in lower 60% of frame
+            risk = 0.0
+            if dist_ratio > 0.50:
+                risk = ((dist_ratio - 0.50) / 0.50) ** 1.8
             if label == "person":
-                risk = min(1.0, risk * 1.4)
+                risk = min(1.0, risk * 1.5)
 
             max_brake = max(max_brake, risk)
             closest = max(closest, dist_ratio)
 
-        if max_brake > 0.01:
-            print(f"[OBS] brake={max_brake:.3f} closest={closest:.3f} dets={len(detections)}")
         return max_brake, closest
 
 
@@ -170,24 +155,16 @@ class ObstacleAssessor:
 # GPS Navigator
 # ───────────────────────────────
 class GPSNavigator:
-    """Extract steering bias and speed hint from GPS minimap crop."""
-
     def __init__(self):
         self.prev_bias = 0.0
 
     def analyze(self, gps_crop):
-        """
-        Returns:
-            steer_bias: -1..1 (negative = route to left, turn left)
-            speed_hint: estimated speed limit from text, or None
-        """
         if gps_crop is None or gps_crop.size == 0:
             return self.prev_bias, None
 
         h, w = gps_crop.shape[:2]
         hsv = cv2.cvtColor(gps_crop, cv2.COLOR_BGR2HSV)
 
-        # Route = red/orange on GPS
         lower1 = np.array([0, 30, 30], dtype=np.uint8)
         upper1 = np.array([35, 255, 255], dtype=np.uint8)
         lower2 = np.array([150, 30, 30], dtype=np.uint8)
@@ -196,22 +173,13 @@ class GPSNavigator:
 
         ys, xs = np.where(mask > 0)
         if len(xs) < 15:
-            print(f"[GPS] No route pixels found ({len(xs)} red pixels)")
             return self.prev_bias, None
 
-        # Route centroid vs player position (roughly center of minimap)
         route_cx = float(np.median(xs))
         player_cx = w * 0.5
-
-        # Normalize: if route is to the right of player, bias positive (turn right)
         bias = (route_cx - player_cx) / (w * 0.45)
-        bias = float(np.clip(bias, -1.0, 1.0))
-
-        # Dampen bias so GPS is a gentle nudge, not a sharp command
-        bias *= 0.35
+        bias = float(np.clip(bias, -1.0, 1.0)) * 0.30
         self.prev_bias = bias
-        print(f"[GPS] route_cx={route_cx:.1f} player_cx={player_cx:.1f} bias={bias:.3f} pixels={len(xs)}")
-
         return bias, None
 
 
@@ -219,8 +187,6 @@ class GPSNavigator:
 # Smooth Rate Limiter
 # ───────────────────────────────
 class RateLimiter:
-    """Limit rate of change to avoid jerky control inputs."""
-
     def __init__(self, max_delta_per_cycle: float):
         self.max_delta = max_delta_per_cycle
         self.value = 0.0
@@ -234,79 +200,76 @@ class RateLimiter:
         self.value += delta
         return self.value
 
+    def reset(self, val: float = 0.0):
+        self.value = val
+
 
 # ───────────────────────────────
 # Main Autopilot
 # ───────────────────────────────
 class Autopilot:
     """
-    High-level autonomous driving orchestrator.
-
     States:
         IDLE      = disabled
         ACTIVE    = normal driving
-        BRAKING   = obstacle detected, slowing down
-        EMERGENCY = watchdog / lost perception -> full stop
+        BRAKING   = obstacle ahead, slowing
+        EMERGENCY = lost lanes / critical error
+        RECOVER   = reversing after crash/stuck
     """
 
     def __init__(self):
         self.vc = VehicleController(hz=30)
-
         self.enabled = False
         self.state = "IDLE"
 
-        # Sub-modules
         self.lane_analyzer = LaneAnalyzer()
         self.obstacle_assessor = ObstacleAssessor()
         self.gps_nav = GPSNavigator()
 
-        # Rate limiters (units per control cycle @ 30 Hz)
-        self.steer_limiter = RateLimiter(max_delta_per_cycle=0.18)
-        self.throttle_limiter = RateLimiter(max_delta_per_cycle=0.08)
+        # Faster throttle response (0.12 per cycle @ 30Hz = full swing in ~8 cycles = 0.27s)
+        self.steer_limiter = RateLimiter(max_delta_per_cycle=0.14)
+        self.throttle_limiter = RateLimiter(max_delta_per_cycle=0.12)
 
-        # Parameters
-        self.target_speed = 75.0          # km/h default
+        # Tuning
+        self.target_speed = 70.0
         self.min_speed = 0.0
-        self.max_speed = 90.0
-        self.kp_steer = 1.1
-        self.kd_steer = 0.35
+        self.max_speed = 85.0
+        self.kp_steer = 0.60
+        self.kd_steer = 0.50
         self.prev_steer_error = 0.0
-        self.kp_speed = 0.015
-        self.speed_integral = 0.0
+        self.kp_speed = 0.012
 
         self._last_update = time.time()
         self._frame_counter = 0
         self._lost_lane_frames = 0
         self._status_info = {}
 
-    # ── Public API ─────────────────
+        # Crash / stuck recovery
+        self._collision_frames = 0
+        self._recover_timer = 0
+        self._last_lane_center = None
+        self._stuck_timer = 0.0
+
+        # Reduce log spam
+        self._log_every = 15  # log summary every 15 frames (~0.5s)
 
     def toggle(self):
         self.enabled = not self.enabled
         if not self.enabled:
-            print("[AP] DISABLED — releasing controls")
+            print("[AP] DISABLED")
             self.vc.set_controls(0.0, 0.0)
             self.vc._release_all()
             self.state = "IDLE"
-            self.steer_limiter.value = 0.0
-            self.throttle_limiter.value = 0.0
+            self.steer_limiter.reset(0.0)
+            self.throttle_limiter.reset(0.0)
+            self._collision_frames = 0
+            self._recover_timer = 0
         else:
-            print("[AP] ENABLED — autonomous driving active")
+            print("[AP] ENABLED")
             self.state = "ACTIVE"
         return self.enabled
 
     def update(self, raw_bgr, da_seg, ll_seg, coral_dets, gps_crop, gps_info):
-        """
-        Main call, invoked once per captured frame (~30 Hz).
-
-        Args:
-            raw_bgr: full BGR frame from screen capture
-            da_seg:  YOLOP drivable area (1,2,H,W)
-            ll_seg:  YOLOP lane lines (1,2,H,W)
-            coral_dets: list of (x1,y1,x2,y2,label,score)
-            gps_crop: BGR crop of GPS minimap region
-            gps_info: dict from nav_overlay (counts etc.)
-        """
         if not self.enabled:
             return {"state": "DISABLED"}
 
@@ -317,100 +280,133 @@ class Autopilot:
 
         h, w = raw_bgr.shape[:2]
 
-        # ── 1. Perception Fusion ──
-        print(f"\n[AP] ===== frame {self._frame_counter} | {w}x{h} =====")
-        lane_center, lane_heading, lane_width = self.lane_analyzer.analyze(
-            ll_seg, w, h
-        )
+        # ── Perception ──
+        lane_center, lane_heading, lane_width = self.lane_analyzer.analyze(ll_seg, w, h)
+        obstacle_brake, closest_obstacle = self.obstacle_assessor.assess(coral_dets, h, w)
+        gps_steer_bias, _ = self.gps_nav.analyze(gps_crop)
 
-        obstacle_brake, closest_obstacle = self.obstacle_assessor.assess(
-            coral_dets, h, w
-        )
+        # ── Crash / Stuck detection ──
+        if obstacle_brake > 0.95 and closest_obstacle > 0.95:
+            self._collision_frames += 1
+        else:
+            self._collision_frames = max(0, self._collision_frames - 2)
 
-        gps_steer_bias, gps_speed_hint = self.gps_nav.analyze(gps_crop)
+        # Stuck detection: lane center barely moving while obstacle very close
+        if lane_center is not None:
+            if self._last_lane_center is not None:
+                if abs(lane_center - self._last_lane_center) < 15 and closest_obstacle > 0.85:
+                    self._stuck_timer += dt
+                else:
+                    self._stuck_timer = max(0.0, self._stuck_timer - dt * 2)
+            self._last_lane_center = lane_center
+        else:
+            self._stuck_timer += dt
 
-        # ── 2. Speed Planning ──
-        target = self.target_speed
-        if gps_speed_hint:
-            target = min(target, gps_speed_hint)
-
-        # Slow for curves (detected by lane heading deviation or GPS bias)
-        curve_factor = 1.0
-        if abs(lane_heading) > 0.25:
-            curve_factor = 0.65
-        elif abs(lane_heading) > 0.12:
-            curve_factor = 0.82
-        elif abs(gps_steer_bias or 0) > 0.25:
-            curve_factor = 0.75
-        target *= curve_factor
-
-        # Obstacle braking feed-forward
-        if obstacle_brake > 0.02:
-            target *= (1.0 - min(1.0, obstacle_brake * 1.3))
+        # State machine transitions
+        if self.state == "RECOVER":
+            self._recover_timer -= 1
+            if self._recover_timer <= 0:
+                print("[AP] RECOVER done, resuming ACTIVE")
+                self.state = "ACTIVE"
+                self.throttle_limiter.reset(0.0)
+                self._stuck_timer = 0.0
+                self._collision_frames = 0
+        elif self._collision_frames > 20 or self._stuck_timer > 2.5:
+            print(f"[AP] CRASH/STUCK detected -> RECOVER (collision={self._collision_frames}, stuck={self._stuck_timer:.1f}s)")
+            self.state = "RECOVER"
+            self._recover_timer = 90  # ~3 seconds @ 30Hz
+            self.throttle_limiter.reset(0.0)
+            self.steer_limiter.reset(0.0)
+        elif self.state == "EMERGENCY":
+            pass  # stay until toggled off/on
+        elif obstacle_brake > 0.02:
             self.state = "BRAKING"
         else:
             if self.state == "BRAKING":
                 self.state = "ACTIVE"
 
-        target = max(self.min_speed, min(self.max_speed, target))
+        # ── Speed Planning ──
+        target = self.target_speed
 
-        # Fake current speed (we don't have telemetry; infer from throttle state)
-        # In future, read speedometer OCR from dashboard.
+        # Curve slowdown
+        curve_factor = 1.0
+        if abs(lane_heading) > 0.30:
+            curve_factor = 0.55
+        elif abs(lane_heading) > 0.15:
+            curve_factor = 0.78
+        elif abs(gps_steer_bias or 0) > 0.28:
+            curve_factor = 0.70
+        target *= curve_factor
+
+        # Obstacle slowdown
+        if obstacle_brake > 0.02 and self.state not in ("RECOVER", "EMERGENCY"):
+            target *= (1.0 - min(1.0, obstacle_brake * 1.2))
+
+        target = max(self.min_speed, min(self.max_speed, target))
         current_speed = self._estimate_speed(gps_info)
 
-        # ── 3. Lateral Control (Steering) ──
+        # ── Lateral Control ──
         steer = 0.0
         if lane_center is not None:
-            # Normalized error: 0 = centered, +1 = far right, -1 = far left
             error = (lane_center - w / 2.0) / (w / 2.0 + 1e-6)
-
-            # Dead zone: don't fight tiny offsets
-            if abs(error) < 0.025:
+            if abs(error) < 0.03:
                 error = 0.0
-
             derivative = (error - self.prev_steer_error) / max(dt, 0.001)
             steer = self.kp_steer * error + self.kd_steer * derivative
             self.prev_steer_error = error
             self._lost_lane_frames = 0
         else:
             self._lost_lane_frames += 1
-            # If lanes lost briefly, damp previous steering toward 0
-            steer = self.prev_steer_error * 0.5
-            if self._lost_lane_frames > 45:  # ~1.5 s
+            steer = self.prev_steer_error * 0.3
+            if self._lost_lane_frames > 45:
                 self.state = "EMERGENCY"
                 steer = 0.0
 
-        # Blend with GPS heading (gentle nudge for long-term route)
+        # Blend GPS
         if gps_steer_bias is not None:
-            # When lanes are strong, GPS is a small correction.
-            # When lanes are missing, GPS dominates.
             lane_conf = 1.0 if lane_center is not None else 0.0
-            alpha = 0.25 if lane_conf else 0.85
+            alpha = 0.22 if lane_conf else 0.80
             steer = (1.0 - alpha) * steer + alpha * gps_steer_bias
 
-        # Clamp
         steer = float(np.clip(steer, -1.0, 1.0))
 
-        # ── 4. Longitudinal Control (Throttle) ──
-        speed_error = target - current_speed
-        throttle = self.kp_speed * speed_error
-
-        # If emergency or obstacle very close, override to brake
-        if self.state == "EMERGENCY" or obstacle_brake > 0.85:
+        # ── Longitudinal Control ──
+        if self.state == "RECOVER":
+            # Reverse straight out
             throttle = -1.0
-        elif closest_obstacle > 0.7 and speed_error > 0:
-            # Don't accelerate into a close obstacle even if under target speed
+            steer = 0.0
+        elif self.state == "EMERGENCY":
+            throttle = -1.0
+        elif obstacle_brake > 0.85 or closest_obstacle > 0.90:
+            # Immediate hard brake, bypass gentle slowdown
+            throttle = -1.0
+        elif closest_obstacle > 0.65 and speed_error > 0:
             throttle = min(throttle, 0.0)
+        else:
+            speed_error = target - current_speed
+            throttle = self.kp_speed * speed_error
 
         throttle = float(np.clip(throttle, -1.0, 1.0))
 
-        # ── 5. Smooth & Apply ──
+        # ── Smooth & Apply ──
         smooth_steer = self.steer_limiter.update(steer)
-        smooth_throttle = self.throttle_limiter.update(throttle)
 
-        print(f"[AP] state={self.state} | raw S={steer:+.2f} T={throttle:+.2f} | smooth S={smooth_steer:+.2f} T={smooth_throttle:+.2f} | Vtgt={target:.1f} Vcur={current_speed:.1f}")
+        # For throttle: if emergency/recover/braking hard, allow faster slew down
+        if self.state in ("RECOVER", "EMERGENCY") or obstacle_brake > 0.85:
+            # Bypass rate limiter for rapid braking
+            smooth_throttle = throttle
+            self.throttle_limiter.reset(throttle)
+        else:
+            smooth_throttle = self.throttle_limiter.update(throttle)
 
         self.vc.set_controls(smooth_steer, smooth_throttle)
+
+        # Logging (throttled)
+        if self._frame_counter % self._log_every == 0:
+            lc = f"{lane_center:.0f}" if lane_center is not None else "--"
+            print(f"[AP] {self.state:8s} S={smooth_steer:+.2f} T={smooth_throttle:+.2f} "
+                  f"Vtgt={target:.0f} lane={lc} obs={obstacle_brake:.2f} "
+                  f"keys={self.vc.active_keys}")
 
         self._status_info = {
             "state": self.state,
@@ -427,8 +423,7 @@ class Autopilot:
         return self._status_info
 
     def emergency_stop(self):
-        """External call for immediate full stop."""
-        print("[AP] EMERGENCY STOP called")
+        print("[AP] EMERGENCY STOP")
         self.state = "EMERGENCY"
         self.vc.emergency_stop()
 
@@ -438,13 +433,6 @@ class Autopilot:
         self.vc.stop()
 
     def _estimate_speed(self, gps_info):
-        """
-        Placeholder speed estimator.
-        In the future, OCR the speedometer digits from the dashboard crop.
-        For now we assume the truck roughly tracks target speed with lag.
-        """
-        # Very crude: if we see GPS text, maybe we can guess
-        # Otherwise return default target as proxy (control loop will handle error)
         return self.target_speed * 0.6
 
     @property

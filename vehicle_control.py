@@ -2,11 +2,6 @@
 vehicle_control.py
 MacOS keyboard vehicle controller for ETS2 using PWM (pulse-width modulation)
 to simulate analog steering/throttle with digital arrow keys.
-
-Arrow Up    = accelerate
-Arrow Down  = brake / reverse
-Arrow Left  = steer left
-Arrow Right = steer right
 """
 import time
 import threading
@@ -24,14 +19,7 @@ _KEY_NAMES = {
 class VehicleController:
     """
     Smooth vehicle control via PWM on digital keys.
-
-    Steering/Throttle are continuous [-1, 1]. We translate to key presses:
-      - |value| < 0.05     -> dead zone, release both keys
-      - 0.05 < |value| < 0.25 -> tap every 4th cycle (gentle micro-adjust)
-      - 0.25 < |value| < 0.55 -> tap every 2nd cycle (moderate)
-      - |value| > 0.55      -> hold every cycle (strong)
-
-    Cycle rate is configurable (default 30 Hz = ~33 ms per cycle).
+    Steering/Throttle are continuous [-1, 1].
     """
 
     def __init__(self, hz: int = 30):
@@ -39,22 +27,21 @@ class VehicleController:
         self.period = 1.0 / hz
         self.kb = Controller()
 
-        self.steering = 0.0   # -1 = full left, +1 = full right
-        self.throttle = 0.0   # -1 = full brake, +1 = full accel
+        self.steering = 0.0
+        self.throttle = 0.0
 
         self._lock = threading.Lock()
         self._running = True
         self._last_cmd_time = time.time()
         self._cycle_counter = 0
         self._pressed_keys = set()
+        self._last_log_keys = set()
         self._log_counter = 0
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        print(f"[VC] VehicleController started at {hz} Hz")
 
     def set_controls(self, steering: float, throttle: float):
-        """Update desired steering [-1,1] and throttle [-1,1]."""
         with self._lock:
             self.steering = max(-1.0, min(1.0, float(steering)))
             self.throttle = max(-1.0, min(1.0, float(throttle)))
@@ -62,17 +49,14 @@ class VehicleController:
 
     @property
     def active_keys(self):
-        """Return list of currently pressed key names."""
         return [_KEY_NAMES.get(k, str(k)) for k in self._pressed_keys]
 
     def _loop(self):
         while self._running:
             t0 = time.time()
 
-            # Watchdog: if no commands for > 0.6 s, emergency release
             if time.time() - self._last_cmd_time > 0.6:
                 if self._pressed_keys:
-                    print("[VC] WATCHDOG: no commands, releasing all keys")
                     self._release_all()
                 time.sleep(self.period)
                 continue
@@ -85,12 +69,16 @@ class VehicleController:
             self._apply_axis("STEER", s, Key.left, Key.right)
             self._apply_axis("THROT", t, Key.down, Key.up)
 
-            # Log every ~1 second (30 cycles)
+            # Log only when key set changes or every ~1.5s
             self._log_counter += 1
-            if self._log_counter >= 30:
+            current_keys = set(self._pressed_keys)
+            if current_keys != self._last_log_keys or self._log_counter >= 45:
                 self._log_counter = 0
-                keys = ",".join(self.active_keys) if self.active_keys else "none"
-                print(f"[VC] steer={s:+.2f} thr={t:+.2f} keys=[{keys}]")
+                self._last_log_keys = current_keys
+                names = self.active_keys
+                if not names:
+                    names = ["none"]
+                print(f"[VC] steer={s:+.2f} thr={t:+.2f} keys=[{','.join(names)}]")
 
             elapsed = time.time() - t0
             sleep = self.period - elapsed
@@ -98,7 +86,6 @@ class VehicleController:
                 time.sleep(sleep)
 
     def _apply_axis(self, name, value, neg_key, pos_key):
-        """PWM key control for a single axis."""
         dead = 0.05
         abs_val = abs(value)
 
@@ -111,13 +98,12 @@ class VehicleController:
         inactive = neg_key if value > 0 else pos_key
         self._release(inactive)
 
-        # Determine duty based on intensity
         if abs_val > 0.55:
-            duty = 1          # every cycle
+            duty = 1
         elif abs_val > 0.25:
-            duty = 2          # every 2nd cycle
+            duty = 2
         else:
-            duty = 4          # every 4th cycle (micro-adjust)
+            duty = 4
 
         if self._cycle_counter % duty == 0:
             self._press(active)
@@ -129,25 +115,22 @@ class VehicleController:
             try:
                 self.kb.press(key)
                 self._pressed_keys.add(key)
-                print(f"[VC] PRESS  {_KEY_NAMES.get(key, str(key))}")
             except Exception as e:
-                print(f"[VC] ERROR pressing {key}: {e}")
+                print(f"[VC] ERROR press {key}: {e}")
 
     def _release(self, key):
         if key in self._pressed_keys:
             try:
                 self.kb.release(key)
                 self._pressed_keys.discard(key)
-                print(f"[VC] RELEASE {_KEY_NAMES.get(key, str(key))}")
             except Exception as e:
-                print(f"[VC] ERROR releasing {key}: {e}")
+                print(f"[VC] ERROR release {key}: {e}")
 
     def _release_all(self):
         for key in list(self._pressed_keys):
             self._release(key)
 
     def emergency_stop(self):
-        """Hard brake, release steering."""
         print("[VC] EMERGENCY STOP")
         with self._lock:
             self.steering = 0.0
@@ -156,10 +139,9 @@ class VehicleController:
         self._press(Key.down)
 
     def stop(self):
-        """Shutdown controller, release all keys."""
-        print("[VC] Stopping controller...")
+        print("[VC] Stopping...")
         self._running = False
         self._release_all()
         if self._thread.is_alive():
             self._thread.join(timeout=0.5)
-        print("[VC] Controller stopped")
+        print("[VC] Stopped")
