@@ -22,6 +22,7 @@ import onnxruntime as ort
 from PIL import Image, ImageTk
 
 from ets2_capture import find_ets2_window, capture_window_quartz, capture_fallback, select_region_manual
+from nav_overlay import NavOverlayWindow
 
 # -----------------------------------------------------------------------------
 # CONFIGURACION
@@ -523,9 +524,26 @@ def main():
     else:
         print(f"[INFO] Ventana: {win_info['width']}x{win_info['height']}")
 
-    print("[INFO] Iniciando overlay...")
+    print("[INFO] Iniciando overlays (2 ventanas)...")
+
+    # Ventana 1: Deteccion de carretera + objetos
     overlay = OverlayWindow(win_info, session, coral_interp, coral_labels, coral_detect)
-    overlay.run()
+
+    # Ventana 2: GPS + retrovisores
+    nav_overlay = NavOverlayWindow(win_info)
+
+    # Lanzar ambas ventanas en hilos separados
+    t1 = threading.Thread(target=overlay.run, daemon=True)
+    t2 = threading.Thread(target=nav_overlay.run, daemon=True)
+    t1.start()
+    t2.start()
+
+    try:
+        while t1.is_alive() or t2.is_alive():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+
     print("[INFO] Cerrado.")
 
 
