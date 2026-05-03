@@ -103,6 +103,9 @@ class NavOverlayWindow:
             self.lbl_right = Label(self.root, bg="black", bd=0)
             self.lbl_right.grid(row=0, column=1, padx=2, pady=2)
 
+        # Referencias a PhotoImage para evitar garbage collection
+        self._tk_imgs = {}
+
         # Info bar
         self.lbl_info = Label(
             self.root, text="Nav Overlay", fg="#00ff00", bg="black",
@@ -210,7 +213,7 @@ class NavOverlayWindow:
             gps_pil = self._pil_from_frame(gps)
             if gps_pil:
                 gps_tk = ImageTk.PhotoImage(image=gps_pil)
-                self.lbl_gps.imgtk = gps_tk
+                self._tk_imgs['gps'] = gps_tk
                 self.lbl_gps.configure(image=gps_tk)
                 total_w = max(total_w, gps_pil.width)
                 total_h += gps_pil.height
@@ -222,7 +225,7 @@ class NavOverlayWindow:
                 left_pil = self._pil_from_frame(left)
                 if left_pil:
                     left_tk = ImageTk.PhotoImage(image=left_pil)
-                    self.lbl_left.imgtk = left_tk
+                    self._tk_imgs['left'] = left_tk
                     self.lbl_left.configure(image=left_tk)
 
             if right is not None:
@@ -230,7 +233,7 @@ class NavOverlayWindow:
                 right_pil = self._pil_from_frame(right)
                 if right_pil:
                     right_tk = ImageTk.PhotoImage(image=right_pil)
-                    self.lbl_right.imgtk = right_tk
+                    self._tk_imgs['right'] = right_tk
                     self.lbl_right.configure(image=right_tk)
 
         # Info bar y geometria
@@ -240,7 +243,6 @@ class NavOverlayWindow:
         gps_w = gps.shape[1] if gps is not None else 0
         gps_h = gps.shape[0] if gps is not None else 0
         if SHOW_MIRRORS and left is not None:
-            # 2 columnas: mirrors arriba, gps abajo
             mirror_w = left.shape[1] if left is not None else 0
             total_w = max(gps_w, mirror_w * 2 + 20)
             total_h = gps_h + (left.shape[0] if left is not None else 0) + 20

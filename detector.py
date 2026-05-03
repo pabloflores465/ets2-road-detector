@@ -317,6 +317,7 @@ class OverlayWindow:
 
         self.frame_result = None
         self.fps = 0
+        self._tk_img = None  # Para evitar garbage collection de PhotoImage
         self._lock = threading.Lock()
 
         self.thread_capture = threading.Thread(target=self._capture_loop, daemon=True)
@@ -475,7 +476,7 @@ class OverlayWindow:
 
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             imgtk = ImageTk.PhotoImage(image=img)
-            self.lbl_main.imgtk = imgtk
+            self._tk_img = imgtk
             self.lbl_main.configure(image=imgtk)
             self.lbl_main.place(x=0, y=0, width=new_w, height=new_h)
 
