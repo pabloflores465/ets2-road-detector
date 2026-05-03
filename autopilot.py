@@ -25,11 +25,12 @@ class LaneAnalyzer:
     is closer to that side -> steer away.
     """
 
-    def __init__(self, ray_x_offset: float = 0.08):
+    def __init__(self, ray_x_offset: float = 0.12):
         # Horizontal offset from image center for each ray (as ratio of width)
         self.ray_x_offset = ray_x_offset
         self.prev_left_y = None
         self.prev_right_y = None
+        self._steer_alpha = 0.65  # fast EMA for steering response
 
     def analyze(self, ll_seg, img_width: int, img_height: int):
         """
@@ -45,19 +46,20 @@ class LaneAnalyzer:
         h, w = prob.shape
 
         # Ray origin: near bottom of image
-        start_y = int(h * 0.90)
-        end_y = int(h * 0.40)  # look up to 40% from top
+        start_y = int(h * 0.92)
+        end_y = int(h * 0.35)  # look up to 35% from top
 
         # Ray X positions in model space
         mid_x = w // 2
         left_x = int(mid_x - w * self.ray_x_offset)
         right_x = int(mid_x + w * self.ray_x_offset)
-        left_x = max(0, min(w - 1, left_x))
-        right_x = max(0, min(w - 1, right_x))
+        left_x = max(1, min(w - 2, left_x))
+        right_x = max(1, min(w - 2, right_x))
 
         # Cast upward from start_y to end_y
-        left_hit = self._raycast_up(prob, left_x, start_y, end_y)
-        right_hit = self._raycast_up(prob, right_x, start_y, end_y)
+        # Use 3-pixel wide rays for robustness
+        left_hit = self._raycast_up_wide(prob, left_x, start_y, end_y)
+        right_hit = self._raycast_up_wide(prob, right_x, start_y, end_y)
 
         # Convert to original image coords
         scale_y = img_height / h
@@ -77,34 +79,39 @@ class LaneAnalyzer:
             # If left_y > right_y, left line is closer to car (lower in image)
             # -> car is closer to left line -> steer RIGHT
             diff = left_y - right_y
-            # Normalize: typical lane width at bottom gives ~100-150 px diff
-            steer = np.clip(diff / 80.0, -1.0, 1.0)
+            # Stronger gain: 50 px diff -> full correction
+            steer = np.clip(diff / 50.0, -1.0, 1.0)
 
         elif left_y is not None and right_y is None:
-            # Only left line visible. Car is probably far to the right,
-            # OR only left line exists. Steer gently left to find right line.
-            # But if left_y is very low (close), we are close to left line -> steer right
-            if left_y > img_height * 0.70:
-                steer = +0.50  # close to left edge, steer right
+            # Only left line visible.
+            if left_y > img_height * 0.75:
+                steer = +0.70  # very close to left edge, steer right hard
+            elif left_y > img_height * 0.60:
+                steer = +0.40
             else:
-                steer = -0.25  # only left visible, drift left gently
+                steer = -0.30  # only left visible far away, drift left
 
         elif right_y is not None and left_y is None:
-            if right_y > img_height * 0.70:
-                steer = -0.50  # close to right edge, steer left
+            if right_y > img_height * 0.75:
+                steer = -0.70
+            elif right_y > img_height * 0.60:
+                steer = -0.40
             else:
-                steer = +0.25
+                steer = +0.30
 
         else:
-            # No lines at all. Damp previous steer toward 0.
+            # No lines at all.
             steer = 0.0
 
         return steer, left_y, right_y
 
-    def _raycast_up(self, prob, x, start_y, end_y):
-        """Return first Y (from bottom going up) where prob > threshold."""
+    def _raycast_up_wide(self, prob, x, start_y, end_y):
+        """Return first Y (from bottom going up) where prob > threshold.
+        Samples a 3-pixel wide column for robustness."""
         for y in range(start_y, end_y - 1, -1):
-            if prob[y, x] > 0.40:
+            if (prob[y, x - 1] > 0.30 or
+                prob[y, x] > 0.30 or
+                prob[y, x + 1] > 0.30):
                 return y
         return None
 
@@ -212,7 +219,7 @@ class Autopilot:
 
         # Smoothing
         self._steer_ema = 0.0
-        self._steer_alpha = 0.35
+        self._steer_alpha = 0.60
 
     def toggle(self):
         self.enabled = not self.enabled

@@ -20,6 +20,10 @@ class VehicleController:
     """
     Smooth vehicle control via PWM on digital keys.
     Steering/Throttle are continuous [-1, 1].
+
+    Key insight for ETS2: keyboard keys need to be held for at least ~60ms
+    to register. We use a min-hold-time per key instead of toggling every
+    single 33ms cycle.
     """
 
     def __init__(self, hz: int = 30):
@@ -35,6 +39,7 @@ class VehicleController:
         self._last_cmd_time = time.time()
         self._cycle_counter = 0
         self._pressed_keys = set()
+        self._key_press_deadline = {}  # key -> release after this timestamp
         self._last_log_keys = set()
         self._log_counter = 0
 
@@ -69,6 +74,12 @@ class VehicleController:
             self._apply_axis("STEER", s, Key.left, Key.right)
             self._apply_axis("THROT", t, Key.down, Key.up)
 
+            # Release keys whose hold-time expired
+            now = time.time()
+            for key in list(self._pressed_keys):
+                if now >= self._key_press_deadline.get(key, 0):
+                    self._release(key)
+
             # Log only when key set changes or every ~1.5s
             self._log_counter += 1
             current_keys = set(self._pressed_keys)
@@ -90,26 +101,41 @@ class VehicleController:
         abs_val = abs(value)
 
         if abs_val < dead:
-            self._release(neg_key)
-            self._release(pos_key)
+            # In dead zone: if key not being held, release both
+            if neg_key not in self._pressed_keys:
+                self._release(neg_key)
+            if pos_key not in self._pressed_keys:
+                self._release(pos_key)
             return
 
         active = pos_key if value > 0 else neg_key
         inactive = neg_key if value > 0 else pos_key
-        self._release(inactive)
 
-        # More aggressive PWM: hold keys longer at lower intensities
-        if abs_val > 0.35:
-            duty = 1   # hold constantly (strong correction)
-        elif abs_val > 0.12:
-            duty = 2   # 50% duty (moderate)
-        else:
-            duty = 4   # 25% duty (gentle micro-adjust)
+        # Release inactive side immediately (unless it has active hold)
+        if inactive not in self._pressed_keys:
+            self._release(inactive)
 
-        if self._cycle_counter % duty == 0:
-            self._press(active)
+        # Decide hold duration based on intensity
+        # Stronger = hold longer. Weaker = tap briefly.
+        if abs_val > 0.50:
+            hold_ms = 0.120  # 120ms strong hold
+        elif abs_val > 0.20:
+            hold_ms = 0.080  # 80ms moderate
         else:
-            self._release(active)
+            hold_ms = 0.050  # 50ms gentle tap
+
+        # If active key already held, extend its deadline
+        if active in self._pressed_keys:
+            self._key_press_deadline[active] = time.time() + hold_ms
+            return
+
+        # Otherwise press it (but respect a small cooldown between presses)
+        last_release = getattr(self, '_last_release_time', {}).get(active, 0)
+        if time.time() - last_release < 0.020:
+            return  # 20ms minimum gap
+
+        self._press(active)
+        self._key_press_deadline[active] = time.time() + hold_ms
 
     def _press(self, key):
         if key not in self._pressed_keys:
@@ -124,6 +150,9 @@ class VehicleController:
             try:
                 self.kb.release(key)
                 self._pressed_keys.discard(key)
+                if not hasattr(self, '_last_release_time'):
+                    self._last_release_time = {}
+                self._last_release_time[key] = time.time()
             except Exception as e:
                 print(f"[VC] ERROR release {key}: {e}")
 
