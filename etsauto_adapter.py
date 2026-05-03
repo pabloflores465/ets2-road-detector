@@ -176,13 +176,32 @@ class ETSAutoLaneDetector:
         # Complete and classify lines
         return self._postprocess_lines(lines)
 
+    def _interpolate_to_grid(self, line, grid_x):
+        """Interpolate a line to a common x grid."""
+        if line is None or len(line) < 2:
+            return None
+        # line: Nx2 where [:,0]=x, [:,1]=y
+        # Sort by x
+        line = line[np.argsort(line[:, 0])]
+        x, y = line[:, 0], line[:, 1]
+        # Remove duplicates
+        mask = np.concatenate(([True], np.diff(x) > 0.001))
+        x, y = x[mask], y[mask]
+        if len(x) < 2:
+            return None
+        y_interp = np.interp(grid_x, x, y, left=y[0], right=y[-1])
+        return np.column_stack((grid_x, y_interp))
+
     def _postprocess_lines(self, lines):
         # Round lines and get skeleton
         lines_temp = []
         for line in lines:
             if len(line) <= 30:
                 continue
-            lines_temp.append(horizontal_rounding(line))
+            try:
+                lines_temp.append(horizontal_rounding(line))
+            except Exception:
+                continue
 
         # Classify by position (y coordinate at x=0)
         line_l = line_r = line_ll = line_rr = None
@@ -198,17 +217,38 @@ class ETSAutoLaneDetector:
                 line_rr = line
 
         # Complete missing lines
+        grid_x = np.arange(0, 60.5, 0.5)
         if line_l is None and line_r is not None:
-            line_l = line_r - np.array([0, self.lane_width])
+            line_r_interp = self._interpolate_to_grid(line_r, grid_x)
+            if line_r_interp is not None:
+                line_l = line_r_interp - np.array([0, self.lane_width])
         elif line_l is not None and line_r is None:
-            line_r = line_l + np.array([0, self.lane_width])
+            line_l_interp = self._interpolate_to_grid(line_l, grid_x)
+            if line_l_interp is not None:
+                line_r = line_l_interp + np.array([0, self.lane_width])
 
-        # Get middle line (trajectory)
-        line_m = get_skeleton(line_l, line_r)
+        # Interpolate both to common grid before averaging
+        line_l_interp = self._interpolate_to_grid(line_l, grid_x)
+        line_r_interp = self._interpolate_to_grid(line_r, grid_x)
+
+        if line_l_interp is not None and line_r_interp is not None:
+            line_m = (line_l_interp + line_r_interp) / 2.0
+            # Add vehicle position point for better polynomial fit
+            line_m = np.vstack((np.array([[-self.controller.wheelbase, 0.0]]), line_m))
+            # Resample with polynomial fit
+            try:
+                pts_x = np.linspace(0, 60, 121)
+                fit = np.polyfit(line_m[:, 0], line_m[:, 1], 3)
+                pts_y = fit[0] * pts_x**3 + fit[1] * pts_x**2 + fit[2] * pts_x + fit[3]
+                line_m = np.column_stack((pts_x, pts_y))
+            except Exception:
+                line_m = None
+        else:
+            line_m = None
 
         return {
-            "line_l": line_l,
-            "line_r": line_r,
+            "line_l": line_l_interp,
+            "line_r": line_r_interp,
             "line_m": line_m,
             "line_ll": line_ll,
             "line_rr": line_rr,
@@ -276,8 +316,9 @@ class ETSAutoAdapter:
         if line_m is None:
             return 0.0, 0.0, {"status": "no_lanes"}
 
-        # Pure pursuit steering
-        ang_rad = self.controller.run(line_m, speed_kmh)
+        # Pure pursuit expects m/s, not km/h
+        speed_ms = speed_kmh / 3.6
+        ang_rad = self.controller.run(line_m, speed_ms)
 
         # Normalize to -1..1 (typical range ±0.4 rad)
         steer = float(np.clip(ang_rad / 0.4, -1.0, 1.0))
