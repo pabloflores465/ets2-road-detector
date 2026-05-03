@@ -1,69 +1,66 @@
 # ETS2 Road Detector Overlay (macOS)
 
-Ventana flotante sin bordes que captura **Euro Truck Simulator 2** usando la API nativa **Quartz** de macOS, detecta en tiempo real con **YOLOP ONNX** y muestra el resultado siempre encima.
+Ventana flotante sin bordes que captura **Euro Truck Simulator 2** usando la API nativa **Quartz** de macOS, detecta en tiempo real y muestra el resultado siempre encima de todo.
 
 ## Que detecta
 
-YOLOP es un modelo multi-task que detecta simultaneamente:
-
-- **Carretera transitable** → verde
+### Carretera y carriles (YOLOP ONNX 640x640)
+- **Area transitable** → verde
 - **Lineas de carril** → rojo
-- **Obstaculos / objetos** → bounding boxes con etiquetas:
-  - `car`, `truck`, `bus` — vehiculos
-  - `person`, `rider`, `bike`, `motor` — peatones y ciclistas
-  - `traffic light`, `traffic sign` — senales de transito
-  - `train` — trenes
 
-## Modos de visualizacion
+### Objetos (Coral Edge TPU — mucho mas rapido)
+- **Vehiculos** → `car`, `truck`, `bus`
+- **Peatones** → `person`, `rider`
+- **Senales** → `traffic light`, `stop sign`
+- **Otros** → `bicycle`, `motorcycle`
 
-Edita `DISPLAY_MODE` en `road_detector.py`:
-
-| Modo | Descripcion |
-|------|-------------|
-| `"overlay"` | Original + deteccion coloreada + objetos (default) |
-| `"mask"` | Solo segmentacion (negro + verde/rojo) |
-| `"split"` | Mitad original, mitad deteccion |
-| `"debug"` | Heatmap de probabilidades crudas del modelo |
-
-## Configuracion de deteccion de objetos
-
-Edita estas constantes en `road_detector.py`:
-
-| Parametro | Descripcion | Default |
-|-----------|-------------|---------|
-| `SHOW_OBJECTS` | Activar/detecar obstaculos | `True` |
-| `CONF_THRESHOLD` | Confianza minima para mostrar objeto | `0.4` |
-| `NMS_IOU_THRESHOLD` | Umbral de supresion de solapamiento | `0.5` |
+Si no tienes Coral TPU, los objetos se detectan con YOLOP (mas lento).
 
 ## Requisitos
 
-- **macOS** (Intel o Apple Silicon)
-- Python 3.9+
+- **macOS** con **Apple Silicon (M1/M2/M3)** o Intel
 - **Euro Truck Simulator 2 abierto**
 - **Permiso de Grabacion de pantalla** para Terminal
+- **Google Coral USB Accelerator** (opcional pero recomendado)
+- `uv` instalado (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 
-## Instalacion rapida
+## Instalacion
 
 ```bash
 cd ets2_road_detector
-chmod +x run.sh
+```
+
+### 1. Instalar `uv` (si no lo tienes)
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### 2. Correr el detector
+
+```bash
 ./run.sh
 ```
 
-La primera vez descarga el modelo YOLOP 640x640 (~34 MB).
+Esto hace todo automaticamente:
+- Crea entorno `uv` con Python 3.9
+- Instala ONNX Runtime, pycoral, tflite-runtime, OpenCV, etc.
+- Descarga YOLOP 640x640 (~34 MB) si no existe
+- Detecta la ventana de ETS2 via Quartz
+- Lanza la ventana flotante con deteccion en tiempo real
 
 ## Uso
 
 1. Abre **Euro Truck Simulator 2**.
 2. Ejecuta `./run.sh`.
-3. El script detecta automaticamente la ventana del juego via Quartz.
-4. Aparece ventana flotante sin bordes siempre encima.
-5. **Arrastra** para moverla.
+3. El script detecta automaticamente la ventana del juego.
+4. Aparece ventana **flotante sin bordes** siempre encima.
+5. **Arrastra** para moverla donde quieras.
 6. Presiona **X** rojo para cerrar.
 
-## Permisos en macOS
+## Permisos en macOS (obligatorio)
 
-### Grabacion de pantalla (obligatorio)
+### Grabacion de pantalla
 
 1. **Preferencias del Sistema > Privacidad y Seguridad > Grabacion de pantalla**
 2. Activa tu terminal (**Terminal**, **iTerm2**, **VS Code**)
@@ -71,74 +68,106 @@ La primera vez descarga el modelo YOLOP 640x640 (~34 MB).
 
 Sin esto la ventana sale negra.
 
-## Coral TPU — ¿Acalaria el proceso?
+## Coral TPU
 
-**Si. Masivamente.** Un Google Coral USB Accelerator puede llevar la inferencia de **~10 FPS en CPU a 30-60+ FPS** con latencia mucho menor.
-
-### Problema
-
-YOLOP ONNX **no corre directamente** en Coral. Necesitas:
-1. Convertir ONNX → TensorFlow Lite (TFLite)
-2. Cuantizar a INT8 (requerido por Edge TPU)
-3. Compilar con `edgetpu_compiler` para generar el modelo `.tflite` con ops aceleradas
-
-### Paso a paso (avanzado)
+### Verificar que funciona
 
 ```bash
-# 1. Instalar dependencias
-pip install onnx tf-keras onnx-tensorflow
-
-# 2. ONNX -> TensorFlow SavedModel
-python -c "
-import onnx
-from onnx_tf.backend import prepare
-model = onnx.load('weights/yolop-640-640.onnx')
-tf_rep = prepare(model)
-tf_rep.export_graph('yolop_tf')
-"
-
-# 3. TensorFlow -> TFLite con cuantizacion INT8
-# (necesitas un dataset representativo para calibracion)
-# Ver: https://coral.ai/docs/edgetpu/models-on-edge/
-
-# 4. Compilar para Edge TPU
-edgetpu_compiler yolop_quantized.tflite
+export DYLD_LIBRARY_PATH="/usr/local/lib:${DYLD_LIBRARY_PATH}"
+uv run python3 -c "from pycoral.utils.edgetpu import list_edge_tpus; print(list_edge_tpus())"
 ```
 
-**Alternativa mas simple:** Si tienes un Mac con **Apple Silicon (M1/M2/M3)**, CoreML ya esta activado y usa el **Neural Engine** interno. No necesitas Coral. Si aun es lento:
-- Baja `MODEL_RES` a `320`
-- Sube `FRAME_SKIP` a `2` o `3`
-- Baja `CAPTURE_MAX_H` a `360`
+Debe mostrar algo como:
+```python
+[{'type': 'usb', 'path': '/sys/bus/usb/devices/1-2'}]
+```
 
-## Configuracion de rendimiento
+### Problemas comunes con Coral
+
+| Problema | Solucion |
+|----------|----------|
+| `dlopen(libedgetpu.1.dylib)` | `export DYLD_LIBRARY_PATH=/usr/local/lib` (ya incluido en `run.sh`) |
+| `SystemError: initialization of _pywrap_coral` | Downgrade numpy: `uv pip install "numpy<2"` |
+| No detecta USB | Usa **hub USB con alimentacion externa**. Coral consume mucha corriente. |
+
+## Modos de visualizacion
+
+Edita `DISPLAY_MODE` en `detector.py`:
+
+| Modo | Descripcion |
+|------|-------------|
+| `"overlay"` | Original + carretera verde + carriles rojos + objetos (default) |
+| `"mask"` | Solo segmentacion (negro + verde/rojo) |
+| `"split"` | Mitad original, mitad deteccion |
+| `"debug"` | Heatmap de probabilidades crudas |
+
+## Configuracion
+
+Edita constantes al inicio de `detector.py`:
 
 | Parametro | Descripcion | Default |
 |-----------|-------------|---------|
 | `MODEL_RES` | 320 (rapido) o 640 (preciso) | `640` |
 | `FRAME_SKIP` | Procesar 1 de cada N frames | `2` |
-| `CAPTURE_MAX_H` | Altura maxima de captura | `480` |
-| `FPS_LIMIT` | Maximo FPS | `30` |
+| `CAPTURE_MAX_H` | Altura maxima captura | `480` |
+| `USE_CORAL` | Usar Coral TPU para objetos | `True` |
 | `SHOW_LANES` | Mostrar lineas de carril | `True` |
-| `ROAD_ALPHA` / `LANE_ALPHA` | Intensidad de colores | `1.0` |
+| `ROAD_ALPHA` / `LANE_ALPHA` | Intensidad colores | `1.0` |
 
 ## Solucion de problemas
 
 | Problema | Solucion |
 |----------|----------|
 | Ventana negra | Falta permiso de Grabacion de pantalla |
-| "No se detecto la ventana" | ETS2 no esta abierto o usa nombre raro |
+| "No se detecto la ventana" | ETS2 no esta abierto |
 | FPS muy bajos | Baja `MODEL_RES` a 320, sube `FRAME_SKIP`, baja `CAPTURE_MAX_H` |
-| No detecta carretera | Prueba modo `debug` para ver heatmap |
-| CPU al 90% | Normal en CPU. CoreML ayuda en Apple Silicon. Coral TPU es lo ideal. |
+| `macOS 26 required, have 16` | Python 3.9 del sistema tiene tkinter roto. `run.sh` usa `uv` con Python 3.9.25 que funciona. |
+| CPU al 90% | Normal. CoreML ayuda. Coral TPU reduce carga masivamente. |
+
+## Comandos utiles
+
+```bash
+# Correr detector (todo automatico)
+./run.sh
+
+# Verificar Coral TPU
+export DYLD_LIBRARY_PATH="/usr/local/lib:${DYLD_LIBRARY_PATH}"
+uv run python3 -c "from pycoral.utils.edgetpu import list_edge_tpus; print(list_edge_tpus())"
+
+# Verificar ONNX Runtime
+uv run python3 -c "import onnxruntime as ort; print(ort.get_available_providers())"
+
+# Instalar dependencias manualmente
+uv pip install onnxruntime opencv-python "numpy<2" Pillow mss pyobjc-framework-Quartz
+uv pip install https://github.com/google-coral/pycoral/releases/download/v2.0.0/tflite_runtime-2.5.0.post1-cp39-cp39-macosx_12_0_arm64.whl
+uv pip install https://github.com/google-coral/pycoral/releases/download/v2.0.0/pycoral-2.0.0-cp39-cp39-macosx_12_0_arm64.whl
+
+# Recrear entorno desde cero
+rm -rf .venv
+uv venv --python 3.9 .venv
+./run.sh
+```
 
 ## Estructura
 
 ```
 ets2_road_detector/
-├── run.sh                  # Lanzador
-├── requirements.txt        # Dependencias
-├── road_detector.py        # Detector principal
+├── run.sh                   # Comando principal: ./run.sh
+├── detector.py              # Detector unificado YOLOP + Coral
+├── ets2_capture.py          # Captura de ventana via Quartz
+├── road_detector.py         # YOLOP puro (legacy)
+├── coral_detector.py        # Coral puro (legacy)
+├── coral_setup.sh           # Script de setup manual para Coral
+├── coral_models/
+│   ├── ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite
+│   └── coco_labels.txt
 ├── weights/
-│   └── yolop-640-640.onnx # Modelo (~34 MB, se descarga solo)
-└── venv/                   # Entorno virtual Python
+│   └── yolop-640-640.onnx   # Se descarga solo al ejecutar
+└── .venv/                   # Entorno uv (no se versiona)
 ```
+
+## Creditos
+
+- Modelo [YOLOP](https://github.com/hustvl/YOLOP) por hustvl
+- ONNX Runtime con [CoreML EP](https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html)
+- [Google Coral](https://coral.ai/) Edge TPU
