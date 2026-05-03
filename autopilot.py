@@ -130,9 +130,17 @@ class ObstacleAssessor:
             area = (x2 - x1) * (y2 - y1)
             area_ratio = area / (img_area + 1e-6)
 
+            # Filter 1: own vehicle / trailer (huge box)
             if area_ratio > 0.20:
                 continue
+
+            # Filter 2: object starts very low = hood/dashboard reflection
             if y1 > img_h * 0.72 and area_ratio > 0.05:
+                continue
+
+            # Filter 3: object touches bottom of frame = almost certainly own vehicle
+            # In ETS2 camera view, nothing real should be this close except the hood
+            if y2 > img_h * 0.88:
                 continue
 
             dist_ratio = y2 / img_h
@@ -143,6 +151,7 @@ class ObstacleAssessor:
             if not in_lane and dist_ratio < 0.70:
                 continue
 
+            # Risk curve: only brake for objects in lower 55% of frame
             risk = 0.0
             if dist_ratio > 0.55:
                 risk = ((dist_ratio - 0.55) / 0.45) ** 2.0
@@ -254,6 +263,9 @@ class Autopilot:
         self._stuck_timer = 0.0
         self._log_every = 15
 
+        # Simple speed estimator
+        self._estimated_speed_val = 0.0
+
     def toggle(self):
         self.enabled = not self.enabled
         if not self.enabled:
@@ -267,6 +279,7 @@ class Autopilot:
             self.prev_steer_error = 0.0
             self._collision_frames = 0
             self._recover_timer = 0
+            self._estimated_speed_val = 0.0
         else:
             print("[AP] ENABLED")
             self.state = "ACTIVE"
@@ -381,20 +394,27 @@ class Autopilot:
         steer = float(np.clip(steer, -1.0, 1.0))
 
         # ── Longitudinal Control ──
+        # CRITICAL: in ETS2, DOWN key when stopped puts the truck in REVERSE.
+        # We NEVER want reverse in normal driving. Throttle floor is 0 (coast).
         speed_error = target - current_speed
         throttle = self.kp_speed * speed_error
 
         if self.state == "RECOVER":
+            # Only reverse in recovery mode after crash
             throttle = -1.0
             steer = 0.0
         elif self.state == "EMERGENCY":
-            throttle = -1.0
+            # Emergency = full brake but don't reverse
+            throttle = 0.0
         elif obstacle_brake > 0.90 or closest_obstacle > 0.96:
-            throttle = -1.0
+            # Hard stop = release throttle (engine braking stops the truck)
+            throttle = 0.0
         elif closest_obstacle > 0.65 and speed_error > 0:
+            # Don't accelerate into obstacle
             throttle = min(throttle, 0.0)
 
-        throttle = float(np.clip(throttle, -1.0, 1.0))
+        # Clamp: NEVER reverse in normal driving. 0 = coast/engine brake.
+        throttle = float(np.clip(throttle, 0.0, 1.0))
 
         # ── Smooth & Apply ──
         smooth_steer = self.steer_limiter.update(steer)
@@ -439,7 +459,24 @@ class Autopilot:
         self.vc.stop()
 
     def _estimate_speed(self, gps_info):
-        return self.target_speed * 0.6
+        """
+        Simple physics-based speed estimator.
+        Tracks speed from throttle history since we don't have telemetry.
+        """
+        accel_rate = 1.2   # km/h gained per frame at full throttle
+        drag = 0.25        # km/h lost per frame when coasting
+        brake_drag = 0.8   # km/h lost per frame when braking
+
+        thr = self.vc.throttle
+        if thr > 0.05:
+            self._estimated_speed_val += thr * accel_rate
+        elif thr < -0.05:
+            self._estimated_speed_val -= brake_drag
+        else:
+            self._estimated_speed_val -= drag
+
+        self._estimated_speed_val = max(0.0, min(self.max_speed, self._estimated_speed_val))
+        return self._estimated_speed_val
 
     @property
     def status(self):
