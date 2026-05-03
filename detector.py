@@ -493,15 +493,20 @@ class MainWindow:
                 ap_state = ap_status.get("state", "?")
                 ap_steer = ap_status.get("steering", 0)
                 ap_thr = ap_status.get("throttle", 0)
-                ap_tgt = ap_status.get("target_speed", 0)
-                hud = f"AP {ap_state} S:{ap_steer:+.2f} T:{ap_thr:+.2f} Vtgt:{ap_tgt:.0f}"
+                ly = ap_status.get("left_y")
+                ry = ap_status.get("right_y")
+                hud = f"AP {ap_state} S:{ap_steer:+.2f} T:{ap_thr:.2f}"
                 cv2.putText(result, hud, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
-                # Visual lane center guide
-                lc = ap_status.get("lane_center")
-                if lc is not None:
-                    cv2.circle(result, (int(lc), h - 20), 8, (0, 255, 0), 2)
-                    cv2.line(result, (w // 2, h - 20), (int(lc), h - 20), (0, 255, 0), 2)
+                # Visual lane rays guide
+                mid_x = w // 2
+                offset = int(w * 0.08)
+                if ly is not None:
+                    cv2.circle(result, (mid_x - offset, int(ly)), 6, (255, 0, 0), 2)
+                if ry is not None:
+                    cv2.circle(result, (mid_x + offset, int(ry)), 6, (255, 0, 0), 2)
+                cv2.line(result, (mid_x - offset, h - 10), (mid_x - offset, h - 80), (0, 255, 255), 1)
+                cv2.line(result, (mid_x + offset, h - 10), (mid_x + offset, h - 80), (0, 255, 255), 1)
 
                 # Log frame + autopilot state for review
                 if self.nav_win and self.nav_win.last_gps_crop is not None:
