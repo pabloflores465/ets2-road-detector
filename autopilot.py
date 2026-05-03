@@ -71,7 +71,6 @@ class Autopilot:
         if not self.enabled:
             print("[AP] DISABLED")
             self.vc.set_controls(0.0, 0.0)
-            self.vc._release_all()
             self.state = "IDLE"
             self._recover_timer = 0
         else:
