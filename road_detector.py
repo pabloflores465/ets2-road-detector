@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-ETS2 Road Detector Overlay - OpenCV Edition (Optimizado)
+ETS2 Road Detector Overlay - YOLOP ONNX (macOS Optimizado)
 
-Detecta carretera y carriles con OpenCV (Canny + Hough Lines + ROI),
-captura la ventana de Euro Truck Simulator 2 via Quartz,
-y muestra overlay flotante siempre encima.
-
-Mas rapido que ONNX/YOLOP para este caso de uso especifico.
+Optimizaciones para Apple Silicon:
+  - CoreML Execution Provider (Neural Engine)
+  - Modelo 320x320 (3x mas rapido que 640x640)
+  - Frame skipping (procesa 1 de cada N frames)
+  - Resize agresivo de captura antes de inferencia
 """
 
 import os
-import subprocess
 import threading
 import time
 import tkinter as tk
 from tkinter import Label, Button
+import urllib.request
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 from PIL import Image, ImageTk
 
 # -----------------------------------------------------------------------------
@@ -25,32 +26,31 @@ from PIL import Image, ImageTk
 # -----------------------------------------------------------------------------
 FPS_LIMIT = 30
 SHOW_LANES = True
-DISPLAY_MODE = "overlay"   # "overlay" | "mask" | "split"
+DISPLAY_MODE = "overlay"   # "overlay" | "mask" | "split" | "debug"
 
-# Colores overlay (BGR)
-COLOR_ROAD = (0, 255, 0)      # verde
-COLOR_LANE = (0, 0, 255)      # rojo
+ROAD_ALPHA = 1.0
+LANE_ALPHA = 1.0
 
-# Area de interes para deteccion (relativo al frame)
-ROI_TOP = 0.50
-ROI_BOTTOM = 1.0
-ROI_LEFT = 0.10
-ROI_RIGHT = 0.90
+COLOR_ROAD = np.array([0, 255, 0], dtype=np.uint8)
+COLOR_LANE = np.array([0, 0, 255], dtype=np.uint8)
 
-# Canny
-CANNY_LOW = 50
-CANNY_HIGH = 150
+# Resolucion del modelo. 320 = rapido, 640 = preciso.
+MODEL_RES = 320  # 320 o 640
 
-# Hough Lines
-HOUGH_THRESHOLD = 50
-HOUGH_MIN_LEN = 40
-HOUGH_MAX_GAP = 100
+# Procesar 1 de cada N frames (1 = todos, 2 = mitad, 3 = un tercio)
+FRAME_SKIP = 2
 
-# Nombres de ventana a buscar
+# Reducir captura a esta altura antes de mandar al modelo
+# (menos pixeles = inferencia mas rapida)
+CAPTURE_MAX_H = 480
+
 WINDOW_NAMES = ["Euro Truck", "eurotrucks2", "ETS2", "Steam"]
 
-# Reducir captura antes de procesar (menos pixeles = mas rapido)
-CAPTURE_MAX_H = 540
+MODEL_URL = (
+    f"https://raw.githubusercontent.com/hustvl/YOLOP/main/weights/"
+    f"yolop-{MODEL_RES}-{MODEL_RES}.onnx"
+)
+MODEL_PATH = f"weights/yolop-{MODEL_RES}-{MODEL_RES}.onnx"
 
 # -----------------------------------------------------------------------------
 # QUARTZ (macOS native)
@@ -179,137 +179,81 @@ def capture_fallback(region):
 
 
 # -----------------------------------------------------------------------------
-# DETECCION DE CARRIL (OpenCV)
+# MODELO YOLOP
 # -----------------------------------------------------------------------------
-def make_coordinates(image, line_parameters):
-    slope, intercept = line_parameters
-    y1 = int(image.shape[0])
-    y2 = int(y1 * 0.6)
-    if slope == 0:
-        return np.array([0, y1, 0, y2])
-    x1 = int((y1 - intercept) / slope)
-    x2 = int((y2 - intercept) / slope)
-    return np.array([x1, y1, x2, y2])
+def ensure_model():
+    if os.path.exists(MODEL_PATH):
+        return
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    print(f"[INFO] Descargando modelo YOLOP {MODEL_RES}x{MODEL_RES} (~{ '8' if MODEL_RES==320 else '34' } MB)...")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print("[INFO] Modelo guardado.")
 
 
-def average_slope_intercept(image, lines):
-    left_fit = []
-    right_fit = []
-    if lines is None:
-        return None, None
-    for line in lines:
-        x1, y1, x2, y2 = line.reshape(4)
-        if x2 - x1 == 0:
-            continue
-        parameters = np.polyfit((x1, x2), (y1, y2), 1)
-        slope = parameters[0]
-        intercept = parameters[1]
-        if abs(slope) < 0.3:
-            continue
-        if slope < 0:
-            left_fit.append((slope, intercept))
-        else:
-            right_fit.append((slope, intercept))
-    left_line = None
-    right_line = None
-    if left_fit:
-        left_fit_average = np.average(left_fit, axis=0)
-        left_line = make_coordinates(image, left_fit_average)
-    if right_fit:
-        right_fit_average = np.average(right_fit, axis=0)
-        right_line = make_coordinates(image, right_fit_average)
-    return left_line, right_line
+def _resize_unscale(img, new_shape, color=114):
+    shape = img.shape[:2]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+    canvas = np.zeros((new_shape[0], new_shape[1], 3), dtype=np.float32)
+    canvas.fill(color)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    new_unpad_w, new_unpad_h = new_unpad
+    pad_w, pad_h = new_shape[1] - new_unpad_w, new_shape[0] - new_unpad_h
+    dw = pad_w // 2
+    dh = pad_h // 2
+    if shape[::-1] != new_unpad:
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_AREA)
+    canvas[dh:dh + new_unpad_h, dw:dw + new_unpad_w, :] = img
+    return canvas, r, dw, dh, new_unpad_w, new_unpad_h
 
 
-def region_of_interest(image, vertices):
-    mask = np.zeros_like(image)
-    if len(image.shape) > 2:
-        channel_count = image.shape[2]
-        ignore_mask_color = (255,) * channel_count
-    else:
-        ignore_mask_color = 255
-    cv2.fillPoly(mask, vertices, ignore_mask_color)
-    return cv2.bitwise_and(image, mask)
+def preprocess(frame_bgr):
+    height, width = frame_bgr.shape[:2]
+    img_rgb = frame_bgr[:, :, ::-1].copy()
+    canvas, r, dw, dh, new_unpad_w, new_unpad_h = _resize_unscale(img_rgb, (MODEL_RES, MODEL_RES))
+    img = canvas.copy().astype(np.float32)
+    img /= 255.0
+    img[:, :, 0] -= 0.485
+    img[:, :, 1] -= 0.456
+    img[:, :, 2] -= 0.406
+    img[:, :, 0] /= 0.229
+    img[:, :, 1] /= 0.224
+    img[:, :, 2] /= 0.225
+    img = img.transpose(2, 0, 1)
+    img = np.expand_dims(img, 0)
+    return img, (height, width, r, dw, dh, new_unpad_w, new_unpad_h)
 
 
-def detect_road_cv(frame):
-    """
-    Detecta carriles/carretera con OpenCV.
-    Retorna: (frame_con_overlay, left_line, right_line)
-    """
-    h, w = frame.shape[:2]
+def postprocess(da_seg_out, ll_seg_out, meta):
+    height, width, r, dw, dh, new_unpad_w, new_unpad_h = meta
+    da = da_seg_out[:, :, dh:dh + new_unpad_h, dw:dw + new_unpad_w]
+    ll = ll_seg_out[:, :, dh:dh + new_unpad_h, dw:dw + new_unpad_w]
 
-    # Vertices ROI (trapecio inferior centrado)
-    vertices = np.array([
-        [
-            (int(w * ROI_LEFT), int(h * ROI_BOTTOM)),
-            (int(w * 0.45), int(h * ROI_TOP)),
-            (int(w * 0.55), int(h * ROI_TOP)),
-            (int(w * ROI_RIGHT), int(h * ROI_BOTTOM)),
-        ]
-    ], dtype=np.int32)
+    # Probabilidad de clase "road" / "lane" (channel 1)
+    da_prob = da[0, 1]  # (H, W)
+    ll_prob = ll[0, 1]  # (H, W)
 
-    # 1. Escala de grises y blur
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    da_mask = np.argmax(da, axis=1)[0]
+    ll_mask = np.argmax(ll, axis=1)[0]
 
-    # 2. Bordes Canny
-    edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
+    da_mask = cv2.resize(da_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
+    ll_mask = cv2.resize(ll_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
+    da_prob = cv2.resize(da_prob.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+    ll_prob = cv2.resize(ll_prob.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
 
-    # 3. Mascara ROI sobre bordes
-    masked_edges = region_of_interest(edges, vertices)
-
-    # 4. Hough Lines
-    lines = cv2.HoughLinesP(
-        masked_edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=HOUGH_THRESHOLD,
-        lines=np.array([]),
-        minLineLength=HOUGH_MIN_LEN,
-        maxLineGap=HOUGH_MAX_GAP,
-    )
-
-    # 5. Promediar lineas izquierda / derecha
-    left_line, right_line = average_slope_intercept(frame, lines)
-
-    # 6. Dibujar overlay
-    overlay = np.zeros_like(frame)
-    line_image = np.zeros_like(frame)
-
-    if left_line is not None:
-        x1, y1, x2, y2 = left_line
-        cv2.line(line_image, (x1, y1), (x2, y2), COLOR_LANE, 10)
-    if right_line is not None:
-        x1, y1, x2, y2 = right_line
-        cv2.line(line_image, (x1, y1), (x2, y2), COLOR_LANE, 10)
-
-    # Rellenar area de carretera entre los dos carriles
-    if left_line is not None and right_line is not None:
-        pts = np.array([
-            [left_line[0], left_line[1]],
-            [left_line[2], left_line[3]],
-            [right_line[2], right_line[3]],
-            [right_line[0], right_line[1]],
-        ], np.int32)
-        cv2.fillPoly(overlay, [pts], COLOR_ROAD)
-
-    # Combinar: original + area carretera + lineas
-    result = cv2.addWeighted(frame, 1.0, overlay, 0.40, 0)
-    result = cv2.addWeighted(result, 1.0, line_image, 1.0, 0)
-
-    # Debug: dibujar ROI en rojo tenue
-    cv2.polylines(result, vertices, True, (0, 0, 255), 2)
-
-    return result, left_line, right_line
+    da_mask = (da_mask > 0.15).astype(np.uint8)
+    ll_mask = (ll_mask > 0.15).astype(np.uint8)
+    return da_mask, ll_mask, da_prob, ll_prob
 
 
 # -----------------------------------------------------------------------------
 # OVERLAY TKINTER
 # -----------------------------------------------------------------------------
 class OverlayWindow:
-    def __init__(self, win_info):
+    def __init__(self, win_info, session):
         self.win_info = win_info
+        self.session = session
         self._win_lock = threading.Lock()
         self._running = True
         self._display_mode = DISPLAY_MODE
@@ -344,8 +288,6 @@ class OverlayWindow:
 
         self.frame_result = None
         self.fps = 0
-        self.left_line = None
-        self.right_line = None
         self._lock = threading.Lock()
 
         self.thread_capture = threading.Thread(target=self._capture_loop, daemon=True)
@@ -367,6 +309,11 @@ class OverlayWindow:
         prev_time = time.time()
         frame_count = 0
         fps_display = 0
+        skip_counter = 0
+        last_da_mask = None
+        last_ll_mask = None
+        last_da_prob = None
+        last_ll_prob = None
 
         while self._running:
             loop_start = time.time()
@@ -386,7 +333,7 @@ class OverlayWindow:
 
             h, w = frame_bgr.shape[:2]
 
-            # Reducir resolucion ANTES de procesar
+            # Reducir resolucion de captura ANTES de inferencia
             if h > CAPTURE_MAX_H:
                 scale = CAPTURE_MAX_H / h
                 new_w = int(w * scale)
@@ -394,8 +341,78 @@ class OverlayWindow:
                 frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
                 h, w = new_h, new_w
 
-            # ---- DETECCION OpenCV ----
-            result, left_line, right_line = detect_road_cv(frame_bgr)
+            # ---- INFERENCIA CON FRAME SKIPPING ----
+            skip_counter += 1
+            if skip_counter >= FRAME_SKIP:
+                skip_counter = 0
+                inp, meta = preprocess(frame_bgr)
+                det_out, da_seg_out, ll_seg_out = self.session.run(
+                    ["det_out", "drive_area_seg", "lane_line_seg"],
+                    {"images": inp},
+                )
+                last_da_mask, last_ll_mask, last_da_prob, last_ll_prob = postprocess(da_seg_out, ll_seg_out, meta)
+
+            da_mask = last_da_mask
+            ll_mask = last_ll_mask
+            da_prob = last_da_prob
+            ll_prob = last_ll_prob
+
+            if da_mask is None:
+                time.sleep(0.05)
+                continue
+
+            # Asegurar que las mascaras coincidan con el frame actual
+            if da_mask.shape[:2] != (h, w):
+                da_mask = cv2.resize(da_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
+                da_mask = (da_mask > 0.15).astype(np.uint8)
+                if da_prob is not None:
+                    da_prob = cv2.resize(da_prob.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+            if ll_mask is not None and ll_mask.shape[:2] != (h, w):
+                ll_mask = cv2.resize(ll_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
+                ll_mask = (ll_mask > 0.15).astype(np.uint8)
+                if ll_prob is not None:
+                    ll_prob = cv2.resize(ll_prob.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+
+            # ---- CONSTRUIR VISUALIZACION ----
+            if self._display_mode == "debug":
+                result = frame_bgr.copy()
+                if da_prob is not None:
+                    heatmap = (np.clip(da_prob, 0, 1) * 255).astype(np.uint8)
+                    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+                    result = cv2.addWeighted(result, 0.4, heatmap_color, 0.6, 0)
+                if ll_prob is not None and SHOW_LANES:
+                    lane_heatmap = (np.clip(ll_prob, 0, 1) * 255).astype(np.uint8)
+                    lane_color = cv2.applyColorMap(lane_heatmap, cv2.COLORMAP_HOT)
+                    result = cv2.addWeighted(result, 0.7, lane_color, 0.3, 0)
+
+            elif self._display_mode == "mask":
+                result = np.zeros((h, w, 3), dtype=np.uint8)
+                result[da_mask == 1] = COLOR_ROAD
+                if SHOW_LANES:
+                    result[ll_mask == 1] = COLOR_LANE
+
+            elif self._display_mode == "split":
+                result = frame_bgr.copy()
+                mid = w // 2
+                overlay = np.zeros_like(result)
+                overlay[da_mask == 1] = COLOR_ROAD
+                if SHOW_LANES:
+                    overlay[ll_mask == 1] = COLOR_LANE
+                right = cv2.addWeighted(result[:, mid:, :], 1.0, overlay[:, mid:, :], ROAD_ALPHA, 0)
+                result[:, mid:, :] = right
+
+            else:  # overlay
+                result = frame_bgr.copy()
+                result[da_mask == 1] = COLOR_ROAD
+                if SHOW_LANES:
+                    result[ll_mask == 1] = COLOR_LANE
+
+            if np.sum(da_mask) == 0 and np.sum(ll_mask) == 0:
+                cv2.putText(result, "NO DETECTA", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+            da_max = float(np.max(da_prob)) if da_prob is not None else 0.0
+            ll_max = float(np.max(ll_prob)) if ll_prob is not None else 0.0
 
             # ---- FPS ----
             frame_count += 1
@@ -408,8 +425,10 @@ class OverlayWindow:
             with self._lock:
                 self.frame_result = result
                 self.fps = fps_display
-                self.left_line = left_line is not None
-                self.right_line = right_line is not None
+                self.road_pixels = int(np.sum(da_mask))
+                self.lane_pixels = int(np.sum(ll_mask))
+                self.da_max = da_max
+                self.ll_max = ll_max
 
             elapsed = time.time() - loop_start
             sleep_time = max(0, (1.0 / FPS_LIMIT) - elapsed)
@@ -425,8 +444,6 @@ class OverlayWindow:
         with self._lock:
             frame = self.frame_result.copy() if self.frame_result is not None else None
             fps = self.fps
-            has_left = self.left_line
-            has_right = self.right_line
 
         if frame is not None:
             h, w = frame.shape[:2]
@@ -447,9 +464,11 @@ class OverlayWindow:
             self.lbl_main.configure(image=imgtk)
             self.lbl_main.place(x=0, y=0, width=new_w, height=new_h)
 
-            l = "L" if has_left else "-"
-            r = "R" if has_right else "-"
-            info_text = f"FPS:{fps} | carriles:{l}{r} | Arrastra para mover"
+            road_pixels = getattr(self, 'road_pixels', 0)
+            lane_pixels = getattr(self, 'lane_pixels', 0)
+            da_max = getattr(self, 'da_max', 0.0)
+            ll_max = getattr(self, 'll_max', 0.0)
+            info_text = f"FPS:{fps} | road:{road_pixels}px | da:{da_max:.2f} | ll:{ll_max:.2f}"
             self.lbl_info.configure(text=info_text)
             self.lbl_info.place(x=0, y=new_h, width=new_w, height=18)
 
@@ -471,9 +490,20 @@ class OverlayWindow:
 # -----------------------------------------------------------------------------
 def main():
     print("=" * 60)
-    print("  ETS2 Road Detector Overlay - OpenCV Optimizado")
+    print("  ETS2 Road Detector Overlay - YOLOP ONNX (Optimizado)")
     print("=" * 60)
     print()
+
+    ensure_model()
+
+    print("[INFO] Cargando modelo ONNX...")
+    ort.set_default_logger_severity(4)
+
+    providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    session = ort.InferenceSession(MODEL_PATH, providers=providers)
+    print(f"[INFO] Modelo listo. Input: {session.get_inputs()[0].shape}")
+    print(f"[INFO] Providers activos: {session.get_providers()}")
+    print(f"[INFO] Config: res={MODEL_RES}, frame_skip={FRAME_SKIP}, capture_max_h={CAPTURE_MAX_H}")
 
     print("[INFO] Buscando ventana de Euro Truck Simulator 2...")
     win_info = find_ets2_window()
@@ -483,12 +513,12 @@ def main():
         print(f"       Pos: ({win_info['left']}, {win_info['top']})")
         print(f"       Size: {win_info['width']}x{win_info['height']}")
     else:
-        print("[WARN] No se detecto automaticamente.")
+        print("[WARN] No se detecto la ventana automaticamente.")
         print("[INFO] Usando seleccion manual...")
         win_info = select_region_manual()
 
     print("[INFO] Iniciando overlay flotante...")
-    overlay = OverlayWindow(win_info)
+    overlay = OverlayWindow(win_info, session)
     overlay.run()
     print("[INFO] Cerrado.")
 

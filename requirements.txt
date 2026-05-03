@@ -2,5 +2,6 @@ opencv-python
 mss
 numpy
 Pillow
+onnxruntime
 pyobjc-framework-Quartz
 pyobjc-framework-ApplicationServices
