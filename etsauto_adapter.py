@@ -233,9 +233,7 @@ class ETSAutoLaneDetector:
 
         if line_l_interp is not None and line_r_interp is not None:
             line_m = (line_l_interp + line_r_interp) / 2.0
-            # Add vehicle position point for better polynomial fit
-            line_m = np.vstack((np.array([[-self.controller.wheelbase, 0.0]]), line_m))
-            # Resample with polynomial fit
+            # Smooth with polynomial fit (no forced origin point)
             try:
                 pts_x = np.linspace(0, 60, 121)
                 fit = np.polyfit(line_m[:, 0], line_m[:, 1], 3)
@@ -294,14 +292,24 @@ class KeyboardLaneController:
         dy = line_m[far_idx, 1] - line_m[near_idx, 1]
         heading_error = math.atan2(dy, dx) if dx > 0.5 else 0.0
 
-        # Combined error for keyboard control
-        # Lateral offset dominates (we want to center in lane)
-        # Heading error adds anticipation for curves
-        # Negative because: if lane is to the right (offset > 0), we need to steer right (positive)
-        error = near_offset * 0.8 + heading_error * 3.0
+        # Keyboard-optimized control:
+        # For digital keys we need significant commands.
+        # Use heading (road direction) as primary signal + small lateral correction.
+        # A 0.05 rad heading (~3°) -> 0.4 steer -> 80ms key press
+        heading_near = math.atan2(
+            line_m[min(15, len(line_m)-1), 1] - line_m[0, 1],
+            line_m[min(15, len(line_m)-1), 0] - line_m[0, 0] + 1e-6
+        )
+        heading_far = math.atan2(
+            line_m[min(35, len(line_m)-1), 1] - line_m[min(15, len(line_m)-1), 1],
+            line_m[min(35, len(line_m)-1), 0] - line_m[min(15, len(line_m)-1), 0] + 1e-6
+        )
 
-        # Clamp to [-1, 1] with dead zone for straight roads
-        if abs(error) < 0.05:
+        # Combine: far heading for anticipation, near heading + offset for centering
+        error = near_offset * 1.5 + heading_near * 4.0 + heading_far * 6.0
+
+        # Clamp to [-1, 1] with tiny dead zone (1cm)
+        if abs(error) < 0.02:
             return 0.0
         steer = np.clip(error, -1.0, 1.0)
         return float(steer)
