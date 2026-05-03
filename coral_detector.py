@@ -22,8 +22,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-# Importar funciones de captura del main detector
-from road_detector import (
+# Importar funciones de captura (sin dependencias de ONNX/TFLite)
+from ets2_capture import (
     find_ets2_window, capture_window_quartz, capture_fallback,
     select_region_manual
 )

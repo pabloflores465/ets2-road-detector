@@ -21,3 +21,5 @@ weights/*.onnx
 edgetpu_runtime/
 edgetpu_runtime_*.zip
 *.tar.gz
+
+venv39/
