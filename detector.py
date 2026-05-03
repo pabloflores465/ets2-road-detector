@@ -629,7 +629,12 @@ def main():
     except tk.TclError:
         root.wm_attributes("-type", "splash")
     root.configure(bg="black", highlightthickness=0)
-    root.geometry("640x480+100+100")
+
+    # Posicionar ventanas en esquinas de la pantalla
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    # Ventana principal: esquina superior izquierda
+    root.geometry(f"640x480+20+40")
 
     # Crear ventana principal
     main_win = MainWindow(root, win_info, session, coral_interp, coral_labels, coral_detect)
@@ -643,7 +648,9 @@ def main():
     except tk.TclError:
         nav_root.wm_attributes("-type", "splash")
     nav_root.configure(bg="black", highlightthickness=0)
-    nav_root.geometry("400x300+800+100")
+    # Ventana nav: esquina superior derecha
+    nav_x = max(20, screen_w - 420)
+    nav_root.geometry(f"400x300+{nav_x}+40")
 
     nav_win = NavOverlayManager(nav_root, win_info)
     main_win.set_nav_overlay(nav_win)
