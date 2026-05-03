@@ -20,8 +20,9 @@ import onnxruntime as ort
 from PIL import Image, ImageTk
 
 from ets2_capture import find_ets2_window, capture_window_quartz, capture_fallback, select_region_manual
-from nav_overlay import NavOverlayManager
+from nav_overlay import NavOverlayManager, get_region_frame, REGIONS
 from autopilot import Autopilot
+from session_logger import SessionLogger
 from pynput import keyboard as pynput_kb
 
 # -----------------------------------------------------------------------------
@@ -285,6 +286,9 @@ class MainWindow:
         # Autopilot
         self.autopilot = Autopilot()
 
+        # Session logger (frames + CSV for off-line review)
+        self.logger = SessionLogger(max_frames=120, save_every=10)
+
         # Frame principal
         self.frame = tk.Frame(root, bg="black")
         self.frame.pack(fill=tk.BOTH, expand=True)
@@ -499,6 +503,13 @@ class MainWindow:
                     cv2.circle(result, (int(lc), h - 20), 8, (0, 255, 0), 2)
                     cv2.line(result, (w // 2, h - 20), (int(lc), h - 20), (0, 255, 0), 2)
 
+                # Log frame + autopilot state for review
+                if self.nav_win and self.nav_win.last_gps_crop is not None:
+                    gps_for_log = self.nav_win.last_gps_crop.copy()
+                else:
+                    gps_for_log = get_region_frame(frame_bgr, REGIONS["gps"])
+                self.logger.save(frame_bgr, result, gps_for_log, ap_status)
+
             da_max = float(np.max(da_prob)) if da_prob is not None else 0.0
             ll_max = float(np.max(ll_prob)) if ll_prob is not None else 0.0
 
@@ -585,6 +596,7 @@ class MainWindow:
     def on_close(self):
         self._running = False
         self.autopilot.shutdown()
+        self.logger.close()
         self.root.destroy()
 
 

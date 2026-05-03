@@ -24,3 +24,6 @@ edgetpu_runtime_*.zip
 
 venv39/
 .venv/
+
+# Session captures (frames + CSV logs)
+captures/

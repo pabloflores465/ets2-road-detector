@@ -438,13 +438,18 @@ class Autopilot:
             "state": self.state,
             "steering": round(smooth_steer, 2),
             "throttle": round(smooth_throttle, 2),
+            "steer_raw": round(steer, 2),
+            "throttle_raw": round(throttle, 2),
             "target_speed": round(target, 1),
             "current_speed": round(current_speed, 1),
             "lane_center": round(lane_center, 1) if lane_center is not None else None,
             "lane_heading": round(lane_heading, 2),
+            "lane_width": round(lane_width, 1) if lane_width is not None else None,
             "obstacle_brake": round(obstacle_brake, 2),
+            "closest_obstacle": round(closest_obstacle, 2),
             "gps_bias": round(gps_steer_bias, 2) if gps_steer_bias is not None else None,
             "keys": self.vc.active_keys,
+            "notes": "",
         }
         return self._status_info
 
