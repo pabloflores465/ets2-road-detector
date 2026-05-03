@@ -6,9 +6,12 @@ Extrae y muestra en ventana flotante siempre encima:
   - Panel GPS / Route Advisor (esquina inferior derecha)
   - Retrovisor izquierdo (esquina superior izquierda)
   - Retrovisor derecho (esquina superior derecha)
+
+NOTA: Esta clase se usa dentro de un Toplevel (ventana secundaria)
+      que comparte el intérprete Tcl con la ventana principal.
+      Esto evita problemas de thread-safety y garbage collection de PhotoImage.
 """
 
-import os
 import threading
 import time
 import tkinter as tk
@@ -26,7 +29,6 @@ from ets2_capture import capture_window_quartz, capture_fallback
 FPS_LIMIT = 30
 
 # Regiones como fracciones del frame (0.0 - 1.0)
-# Ajusta segun tu resolucion y preferencias
 REGIONS = {
     "gps": {
         "left": 0.60, "top": 0.58,
@@ -42,17 +44,14 @@ REGIONS = {
     },
 }
 
-# Cuanto escalar la ventana de salida (para que no sea gigante)
-SCALE = 1.0  # 1.0 = tamano original de las regiones
-
-# Mostrar retrovisores?
+SCALE = 1.0
 SHOW_MIRRORS = True
+
 
 # -----------------------------------------------------------------------------
 # UTILIDADES
 # -----------------------------------------------------------------------------
 def get_region_frame(frame, region_spec):
-    """Extrae una region rectangular de un frame."""
     h, w = frame.shape[:2]
     x = int(region_spec["left"] * w)
     y = int(region_spec["top"] * h)
@@ -66,23 +65,16 @@ def get_region_frame(frame, region_spec):
 
 
 # -----------------------------------------------------------------------------
-# OVERLAY TKINTER
+# NAV OVERLAY (para usar dentro de un Toplevel)
 # -----------------------------------------------------------------------------
-class NavOverlayWindow:
-    def __init__(self, win_info):
+class NavOverlayManager:
+    """Gestiona el contenido de la ventana de navegacion dentro de un Toplevel."""
+
+    def __init__(self, toplevel, win_info):
+        self.root = toplevel
         self.win_info = win_info
         self._win_lock = threading.Lock()
         self._running = True
-
-        self.root = tk.Tk()
-        self.root.title("ETS2 Nav + Mirrors")
-        self.root.attributes("-topmost", True)
-        try:
-            self.root.overrideredirect(True)
-        except tk.TclError:
-            # macOS tkinter bug: usar wm_attributes como fallback
-            self.root.wm_attributes("-type", "splash")
-        self.root.configure(bg="black", highlightthickness=0)
 
         # Boton X rojo
         self.btn_close = Button(
@@ -92,7 +84,6 @@ class NavOverlayWindow:
         )
         self.btn_close.place(x=0, y=0)
 
-        # Labels para cada region
         self.lbl_gps = Label(self.root, bg="black", bd=0)
         self.lbl_gps.grid(row=1, column=0, columnspan=2, padx=2, pady=2)
 
@@ -103,10 +94,6 @@ class NavOverlayWindow:
             self.lbl_right = Label(self.root, bg="black", bd=0)
             self.lbl_right.grid(row=0, column=1, padx=2, pady=2)
 
-        # Referencias a PhotoImage para evitar garbage collection
-        self._tk_imgs = {}
-
-        # Info bar
         self.lbl_info = Label(
             self.root, text="Nav Overlay", fg="#00ff00", bg="black",
             font=("Courier", 8), bd=0, padx=4, pady=2,
@@ -125,11 +112,15 @@ class NavOverlayWindow:
         self.right_img = None
         self.fps = 0
 
+        # PhotoImage references para evitar GC
+        self._tk_gps = None
+        self._tk_left = None
+        self._tk_right = None
+
         self.thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.thread.start()
 
         self._schedule_update()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _start_move(self, event):
         self._drag_x = event.x
@@ -151,21 +142,15 @@ class NavOverlayWindow:
             with self._win_lock:
                 info = dict(self.win_info)
 
-            if info.get("id"):
-                frame_bgr = capture_window_quartz(info["id"])
-            else:
-                frame_bgr = capture_fallback(info)
-
+            frame_bgr = capture_window_quartz(info["id"]) if info.get("id") else capture_fallback(info)
             if frame_bgr is None:
                 time.sleep(0.2)
                 continue
 
-            # Extraer regiones
             gps_frame = get_region_frame(frame_bgr, REGIONS["gps"])
             left_frame = get_region_frame(frame_bgr, REGIONS["mirror_left"]) if SHOW_MIRRORS else None
             right_frame = get_region_frame(frame_bgr, REGIONS["mirror_right"]) if SHOW_MIRRORS else None
 
-            # FPS
             frame_count += 1
             now = time.time()
             if now - prev_time >= 1.0:
@@ -206,15 +191,14 @@ class NavOverlayWindow:
         total_w = 0
         total_h = 0
 
-        # GPS (principal)
+        # GPS
         if gps is not None:
             if SCALE != 1.0:
                 gps = cv2.resize(gps, None, fx=SCALE, fy=SCALE, interpolation=cv2.INTER_AREA)
             gps_pil = self._pil_from_frame(gps)
             if gps_pil:
-                gps_tk = ImageTk.PhotoImage(image=gps_pil)
-                self._tk_imgs['gps'] = gps_tk
-                self.lbl_gps.configure(image=gps_tk)
+                self._tk_gps = ImageTk.PhotoImage(image=gps_pil)
+                self.lbl_gps.configure(image=self._tk_gps)
                 total_w = max(total_w, gps_pil.width)
                 total_h += gps_pil.height
 
@@ -224,22 +208,18 @@ class NavOverlayWindow:
                 left = cv2.resize(left, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
                 left_pil = self._pil_from_frame(left)
                 if left_pil:
-                    left_tk = ImageTk.PhotoImage(image=left_pil)
-                    self._tk_imgs['left'] = left_tk
-                    self.lbl_left.configure(image=left_tk)
+                    self._tk_left = ImageTk.PhotoImage(image=left_pil)
+                    self.lbl_left.configure(image=self._tk_left)
 
             if right is not None:
                 right = cv2.resize(right, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
                 right_pil = self._pil_from_frame(right)
                 if right_pil:
-                    right_tk = ImageTk.PhotoImage(image=right_pil)
-                    self._tk_imgs['right'] = right_tk
-                    self.lbl_right.configure(image=right_tk)
+                    self._tk_right = ImageTk.PhotoImage(image=right_pil)
+                    self.lbl_right.configure(image=self._tk_right)
 
-        # Info bar y geometria
         self.lbl_info.configure(text=f"Nav FPS:{fps} | Arrastra para mover | X para cerrar")
 
-        # Calcular geometria de la ventana
         gps_w = gps.shape[1] if gps is not None else 0
         gps_h = gps.shape[0] if gps is not None else 0
         if SHOW_MIRRORS and left is not None:
@@ -259,6 +239,3 @@ class NavOverlayWindow:
     def on_close(self):
         self._running = False
         self.root.destroy()
-
-    def run(self):
-        self.root.mainloop()

@@ -2,11 +2,9 @@
 """
 ETS2 Unified Detector — YOLOP ONNX + Coral Edge TPU
 
-Un solo detector que combina:
-  - YOLOP ONNX 640x640  → carretera (verde) + carriles (rojo)
-  - Coral Edge TPU       → objetos (coches, senales, peatones)
-
-Todo en una sola ventana flotante, siempre encima.
+Dos ventanas flotantes siempre encima:
+  1. Deteccion de carretera, carriles y objetos
+  2. Panel GPS + retrovisores
 """
 
 import os
@@ -22,7 +20,7 @@ import onnxruntime as ort
 from PIL import Image, ImageTk
 
 from ets2_capture import find_ets2_window, capture_window_quartz, capture_fallback, select_region_manual
-from nav_overlay import NavOverlayWindow
+from nav_overlay import NavOverlayManager
 
 # -----------------------------------------------------------------------------
 # CONFIGURACION
@@ -41,12 +39,10 @@ MODEL_RES = 640
 FRAME_SKIP = 2
 CAPTURE_MAX_H = 480
 
-# YOLOP object detection
 SHOW_OBJECTS = True
 YOLOP_CONF = 0.4
 NMS_IOU = 0.5
 
-# Coral TPU object detection (replaces YOLOP objects if available)
 USE_CORAL = True
 CORAL_MODEL = "coral_models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite"
 CORAL_LABELS = "coral_models/coco_labels.txt"
@@ -58,7 +54,6 @@ MODEL_URL = (
 )
 MODEL_PATH = f"weights/yolop-{MODEL_RES}-{MODEL_RES}.onnx"
 
-# YOLOP class names
 YOLOP_CLASSES = [
     "bike", "bus", "car", "motor", "person",
     "rider", "traffic light", "traffic sign", "train", "truck"
@@ -71,14 +66,12 @@ YOLOP_COLORS = [
 
 
 # -----------------------------------------------------------------------------
-# CORAL TPU LOADING
+# CORAL TPU
 # -----------------------------------------------------------------------------
 def load_coral():
-    """Carga Coral TPU si esta disponible."""
     if not USE_CORAL:
         return None, None, None
     try:
-        import tflite_runtime.interpreter as tflite
         from pycoral.utils.edgetpu import make_interpreter
         from pycoral.adapters import detect as coral_detect_mod
     except ImportError as e:
@@ -104,7 +97,6 @@ def load_coral():
 
 
 def coral_infer(interpreter, detect_mod, frame_bgr, labels, conf_thresh=0.4):
-    """Corre inferencia Coral y retorna [x1,y1,x2,y2,conf,label_text]."""
     import tflite_runtime.interpreter as tflite
     from pycoral.adapters import common
 
@@ -146,7 +138,7 @@ def draw_coral_dets(frame, detections):
 
 
 # -----------------------------------------------------------------------------
-# YOLOP UTILITIES
+# YOLOP
 # -----------------------------------------------------------------------------
 def ensure_model():
     if os.path.exists(MODEL_PATH):
@@ -272,59 +264,54 @@ def draw_yolop_dets(frame, detections):
 
 
 # -----------------------------------------------------------------------------
-# OVERLAY TKINTER
+# VENTANA PRINCIPAL (DETECCION)
 # -----------------------------------------------------------------------------
-class OverlayWindow:
-    def __init__(self, win_info, session, coral_interpreter, coral_labels, coral_detect_mod):
+class MainWindow:
+    def __init__(self, root, win_info, session, coral_interpreter, coral_labels, coral_detect_mod):
+        self.root = root
         self.win_info = win_info
         self.session = session
         self.coral_interpreter = coral_interpreter
         self.coral_labels = coral_labels
         self.coral_detect_mod = coral_detect_mod
+        self.use_coral = coral_interpreter is not None
         self._win_lock = threading.Lock()
         self._running = True
         self._display_mode = DISPLAY_MODE
-        self.use_coral = coral_interpreter is not None
 
-        self.root = tk.Tk()
-        self.root.title("ETS2 Unified Detector")
-        self.root.attributes("-topmost", True)
-        try:
-            self.root.overrideredirect(True)
-        except tk.TclError:
-            self.root.wm_attributes("-type", "splash")
-        self.root.configure(bg="black", highlightthickness=0)
+        # Frame principal
+        self.frame = tk.Frame(root, bg="black")
+        self.frame.pack(fill=tk.BOTH, expand=True)
 
         self.btn_close = Button(
-            self.root, text="X", command=self.on_close,
+            self.frame, text="X", command=self.on_close,
             bg="#cc0000", fg="white", font=("Arial", 8, "bold"),
             bd=0, padx=5, pady=1, cursor="hand2"
         )
         self.btn_close.place(x=0, y=0)
 
-        self.lbl_main = Label(self.root, bg="black", bd=0)
+        self.lbl_main = Label(self.frame, bg="black", bd=0)
         self.lbl_main.place(x=0, y=0)
 
         self.lbl_info = Label(
-            self.root, text="Iniciando...", fg="#00ff00", bg="black",
+            self.frame, text="Iniciando...", fg="#00ff00", bg="black",
             font=("Courier", 9), bd=0, padx=4, pady=2,
         )
 
-        self.root.bind("<Button-1>", self._start_move)
-        self.root.bind("<B1-Motion>", self._on_move)
+        self.frame.bind("<Button-1>", self._start_move)
+        self.frame.bind("<B1-Motion>", self._on_move)
         self._drag_x = 0
         self._drag_y = 0
 
         self.frame_result = None
         self.fps = 0
-        self._tk_img = None  # Para evitar garbage collection de PhotoImage
+        self._tk_img = None
         self._lock = threading.Lock()
 
         self.thread_capture = threading.Thread(target=self._capture_loop, daemon=True)
         self.thread_capture.start()
 
         self._schedule_update()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _start_move(self, event):
         self._drag_x = event.x
@@ -360,7 +347,6 @@ class OverlayWindow:
                 frame_bgr = cv2.resize(frame_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
                 h, w = frame_bgr.shape[:2]
 
-            # ---- INFERENCIA ----
             skip_counter += 1
             if skip_counter >= FRAME_SKIP:
                 skip_counter = 0
@@ -370,7 +356,6 @@ class OverlayWindow:
                     {"images": inp},
                 )
                 last_da_mask, last_ll_mask, last_da_prob, last_ll_prob = postprocess(da_seg_out, ll_seg_out, meta)
-
                 if self.use_coral:
                     last_objs = coral_infer(self.coral_interpreter, self.coral_detect_mod, frame_bgr, self.coral_labels, CORAL_CONF)
                 elif SHOW_OBJECTS:
@@ -399,7 +384,7 @@ class OverlayWindow:
                 if ll_prob is not None:
                     ll_prob = cv2.resize(ll_prob.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
 
-            # ---- VISUALIZACION ----
+            # Visualizacion
             if self._display_mode == "debug":
                 result = frame_bgr.copy()
                 if da_prob is not None:
@@ -413,7 +398,7 @@ class OverlayWindow:
                 result[da_mask == 1] = COLOR_ROAD
                 if SHOW_LANES:
                     result[ll_mask == 1] = COLOR_LANE
-            else:  # overlay (default)
+            else:  # overlay
                 result = frame_bgr.copy()
                 result[da_mask == 1] = COLOR_ROAD
                 if SHOW_LANES:
@@ -492,9 +477,6 @@ class OverlayWindow:
         self._running = False
         self.root.destroy()
 
-    def run(self):
-        self.root.mainloop()
-
 
 # -----------------------------------------------------------------------------
 # MAIN
@@ -528,19 +510,38 @@ def main():
     else:
         print(f"[INFO] Ventana: {win_info['width']}x{win_info['height']}")
 
-    print("[INFO] Iniciando overlays (2 ventanas)...")
-
-    # Ambas ventanas se crean en el hilo PRINCIPAL (tkinter no es thread-safe)
-    overlay = OverlayWindow(win_info, session, coral_interp, coral_labels, coral_detect)
-    nav_overlay = NavOverlayWindow(win_info)
-
-    # Solo un mainloop en el hilo principal; maneja ambas ventanas
+    # Ventana raiz (tkinter no es thread-safe, todo en main thread)
+    root = tk.Tk()
+    root.title("ETS2 Unified Detector")
+    root.attributes("-topmost", True)
     try:
-        nav_overlay.run()
+        root.overrideredirect(True)
+    except tk.TclError:
+        root.wm_attributes("-type", "splash")
+    root.configure(bg="black", highlightthickness=0)
+    root.geometry("640x480+100+100")
+
+    # Crear ventana principal
+    main_win = MainWindow(root, win_info, session, coral_interp, coral_labels, coral_detect)
+
+    # Crear ventana secundaria (Toplevel comparte el mismo intérprete Tcl)
+    nav_root = tk.Toplevel(root)
+    nav_root.title("ETS2 Nav + Mirrors")
+    nav_root.attributes("-topmost", True)
+    try:
+        nav_root.overrideredirect(True)
+    except tk.TclError:
+        nav_root.wm_attributes("-type", "splash")
+    nav_root.configure(bg="black", highlightthickness=0)
+    nav_root.geometry("400x300+800+100")
+
+    nav_win = NavOverlayManager(nav_root, win_info)
+
+    try:
+        root.mainloop()
     except KeyboardInterrupt:
         pass
 
-    overlay.on_close()
     print("[INFO] Cerrado.")
 
 
