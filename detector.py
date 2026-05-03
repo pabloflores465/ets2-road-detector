@@ -500,13 +500,19 @@ class MainWindow:
 
                 # Visual lane rays guide
                 mid_x = w // 2
-                offset = int(w * 0.08)
+                offset = int(w * 0.06)  # MUST match autopilot.py ray_x_offset
+                # Draw full vertical ray lines (bright yellow)
+                cv2.line(result, (mid_x - offset, h - 5), (mid_x - offset, 0), (0, 255, 255), 2)
+                cv2.line(result, (mid_x + offset, h - 5), (mid_x + offset, 0), (0, 255, 255), 2)
+                # Draw intersection points (big red circles)
                 if ly is not None:
-                    cv2.circle(result, (mid_x - offset, int(ly)), 6, (255, 0, 0), 2)
+                    cv2.circle(result, (mid_x - offset, int(ly)), 10, (0, 0, 255), 3)
+                    cv2.putText(result, f"L{int(ly)}", (mid_x - offset - 20, int(ly) - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 if ry is not None:
-                    cv2.circle(result, (mid_x + offset, int(ry)), 6, (255, 0, 0), 2)
-                cv2.line(result, (mid_x - offset, h - 10), (mid_x - offset, h - 80), (0, 255, 255), 1)
-                cv2.line(result, (mid_x + offset, h - 10), (mid_x + offset, h - 80), (0, 255, 255), 1)
+                    cv2.circle(result, (mid_x + offset, int(ry)), 10, (0, 0, 255), 3)
+                    cv2.putText(result, f"R{int(ry)}", (mid_x + offset + 5, int(ry) - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
                 # Log frame + autopilot state for review
                 if self.nav_win and self.nav_win.last_gps_crop is not None:

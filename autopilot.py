@@ -25,8 +25,11 @@ class LaneAnalyzer:
     is closer to that side -> steer away.
     """
 
-    def __init__(self, ray_x_offset: float = 0.12):
+    def __init__(self, ray_x_offset: float = 0.06):
         # Horizontal offset from image center for each ray (as ratio of width)
+        # IMPORTANT: must be small enough that rays cross the RED lane lines,
+        # not the green drivable area. At 640x480, lane lines are ~60-80px
+        # from center. Offset 0.06 = ~38px at 640w.
         self.ray_x_offset = ray_x_offset
         self.prev_left_y = None
         self.prev_right_y = None
@@ -47,17 +50,17 @@ class LaneAnalyzer:
 
         # Ray origin: near bottom of image
         start_y = int(h * 0.92)
-        end_y = int(h * 0.35)  # look up to 35% from top
+        end_y = int(h * 0.30)  # look up to 30% from top
 
         # Ray X positions in model space
         mid_x = w // 2
         left_x = int(mid_x - w * self.ray_x_offset)
         right_x = int(mid_x + w * self.ray_x_offset)
-        left_x = max(1, min(w - 2, left_x))
-        right_x = max(1, min(w - 2, right_x))
+        left_x = max(2, min(w - 3, left_x))
+        right_x = max(2, min(w - 3, right_x))
 
         # Cast upward from start_y to end_y
-        # Use 3-pixel wide rays for robustness
+        # Use 5-pixel wide rays for robustness + low threshold
         left_hit = self._raycast_up_wide(prob, left_x, start_y, end_y)
         right_hit = self._raycast_up_wide(prob, right_x, start_y, end_y)
 
@@ -79,25 +82,29 @@ class LaneAnalyzer:
             # If left_y > right_y, left line is closer to car (lower in image)
             # -> car is closer to left line -> steer RIGHT
             diff = left_y - right_y
-            # Stronger gain: 50 px diff -> full correction
-            steer = np.clip(diff / 50.0, -1.0, 1.0)
+            # Very strong gain: 40 px diff -> full correction
+            raw_steer = np.clip(diff / 40.0, -1.0, 1.0)
+            # Boost small corrections so the truck doesn't drift
+            if abs(raw_steer) < 0.15:
+                raw_steer = np.sign(raw_steer) * 0.20
+            steer = raw_steer
 
         elif left_y is not None and right_y is None:
             # Only left line visible.
             if left_y > img_height * 0.75:
-                steer = +0.70  # very close to left edge, steer right hard
+                steer = +0.80  # very close to left edge, steer right hard
             elif left_y > img_height * 0.60:
-                steer = +0.40
+                steer = +0.50
             else:
-                steer = -0.30  # only left visible far away, drift left
+                steer = -0.40  # only left visible far away, drift left
 
         elif right_y is not None and left_y is None:
             if right_y > img_height * 0.75:
-                steer = -0.70
+                steer = -0.80
             elif right_y > img_height * 0.60:
-                steer = -0.40
+                steer = -0.50
             else:
-                steer = +0.30
+                steer = +0.40
 
         else:
             # No lines at all.
@@ -107,11 +114,14 @@ class LaneAnalyzer:
 
     def _raycast_up_wide(self, prob, x, start_y, end_y):
         """Return first Y (from bottom going up) where prob > threshold.
-        Samples a 3-pixel wide column for robustness."""
+        Samples a 5-pixel wide column with very low threshold."""
         for y in range(start_y, end_y - 1, -1):
-            if (prob[y, x - 1] > 0.30 or
-                prob[y, x] > 0.30 or
-                prob[y, x + 1] > 0.30):
+            # Sample 5 pixels horizontally for robustness
+            vals = [
+                prob[y, x - 2], prob[y, x - 1], prob[y, x],
+                prob[y, x + 1], prob[y, x + 2]
+            ]
+            if max(vals) > 0.12:  # very low threshold to catch thin lane lines
                 return y
         return None
 
@@ -132,6 +142,9 @@ class ObstacleAssessor:
         for det in detections:
             x1, y1, x2, y2, label, score = det
             if label not in self.DANGEROUS:
+                continue
+            # Stricter thresholds to avoid false positives
+            if label in ("car", "truck", "bus") and score < 0.45:
                 continue
             if label == "person" and score < 0.55:
                 continue
