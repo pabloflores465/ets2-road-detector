@@ -1,10 +1,6 @@
 """
 autopilot.py
 Autonomous driving stack for Euro Truck Simulator 2.
-
-Architecture:
-  Perception -> World Model -> Planning -> Control
-  (YOLOP lanes, Coral objects, GPS minimap) -> (Lane keep, Path follow, Obstacle avoid) -> (PWM keys)
 """
 import time
 import collections
@@ -19,18 +15,18 @@ from vehicle_control import VehicleController
 class LaneAnalyzer:
     """Extract lane geometry from YOLOP ll_seg output."""
 
-    def __init__(self, lane_width_ratio: float = 0.35):
+    def __init__(self, lane_width_ratio: float = 0.32):
         self.lane_width_ratio = lane_width_ratio
         self.prev_center = None
         self.prev_heading = 0.0
         self._width_history = collections.deque(maxlen=20)
-        self._center_history = collections.deque(maxlen=10)
+        self._ema_center = None
+        self._ema_alpha = 0.60  # fast response, some smoothing
 
     def _estimated_lane_width(self, img_width: int):
         if self._width_history:
             return float(np.median(self._width_history))
-        # Conservative default for ETS2 at ~480p capture
-        return img_width * 0.28
+        return img_width * 0.26
 
     def analyze(self, ll_seg, img_width: int, img_height: int):
         if ll_seg is None or ll_seg.size == 0:
@@ -41,7 +37,6 @@ class LaneAnalyzer:
         scale_x = img_width / w
         scale_y = img_height / h
 
-        # Sample rows in bottom half (closer to truck)
         y_ratios = [0.55, 0.65, 0.75, 0.85, 0.92]
         centers = []
         left_xs = []
@@ -85,19 +80,20 @@ class LaneAnalyzer:
         if not centers:
             return self.prev_center, self.prev_heading, None
 
-        lane_center = float(np.median(centers))
+        raw_center = float(np.median(centers))
 
-        # Update width history when we saw both lines
         if widths:
             self._width_history.append(float(np.median(widths)))
 
         lane_width = self._estimated_lane_width(img_width)
 
-        # Smooth center with history to reduce jitter
-        self._center_history.append(lane_center)
-        lane_center = float(np.median(self._center_history))
+        # EMA smoothing: fast reaction, no lag from history window
+        if self._ema_center is None:
+            self._ema_center = raw_center
+        else:
+            self._ema_center = self._ema_alpha * raw_center + (1 - self._ema_alpha) * self._ema_center
+        lane_center = float(self._ema_center)
 
-        # Heading from top vs bottom center drift
         heading = 0.0
         if len(centers) >= 2:
             dy = (y_ratios[-1] - y_ratios[0]) * h * scale_y
@@ -134,12 +130,8 @@ class ObstacleAssessor:
             area = (x2 - x1) * (y2 - y1)
             area_ratio = area / (img_area + 1e-6)
 
-            # Filter 1: own vehicle / trailer (huge box at bottom)
             if area_ratio > 0.20:
-                # Object covers >20% of screen = almost certainly our own truck
                 continue
-
-            # Filter 2: object starts very low (y1 > 70%) = hood/dashboard reflection
             if y1 > img_h * 0.72 and area_ratio > 0.05:
                 continue
 
@@ -151,7 +143,6 @@ class ObstacleAssessor:
             if not in_lane and dist_ratio < 0.70:
                 continue
 
-            # Risk curve: only brake for objects in lower 55% of frame
             risk = 0.0
             if dist_ratio > 0.55:
                 risk = ((dist_ratio - 0.55) / 0.45) ** 2.0
@@ -191,7 +182,7 @@ class GPSNavigator:
         route_cx = float(np.median(xs))
         player_cx = w * 0.5
         bias = (route_cx - player_cx) / (w * 0.45)
-        bias = float(np.clip(bias, -1.0, 1.0)) * 0.30
+        bias = float(np.clip(bias, -1.0, 1.0)) * 0.25
         self.prev_bias = bias
         return bias, None
 
@@ -222,12 +213,7 @@ class RateLimiter:
 # ───────────────────────────────
 class Autopilot:
     """
-    States:
-        IDLE      = disabled
-        ACTIVE    = normal driving
-        BRAKING   = obstacle ahead, slowing
-        EMERGENCY = lost lanes / critical error
-        RECOVER   = reversing after crash/stuck
+    States: IDLE, ACTIVE, BRAKING, EMERGENCY, RECOVER
     """
 
     def __init__(self):
@@ -239,32 +225,34 @@ class Autopilot:
         self.obstacle_assessor = ObstacleAssessor()
         self.gps_nav = GPSNavigator()
 
-        # Faster throttle response (0.12 per cycle @ 30Hz = full swing in ~8 cycles = 0.27s)
-        self.steer_limiter = RateLimiter(max_delta_per_cycle=0.14)
-        self.throttle_limiter = RateLimiter(max_delta_per_cycle=0.12)
+        # Rate limiters
+        self.steer_limiter = RateLimiter(max_delta_per_cycle=0.12)
+        self.throttle_limiter = RateLimiter(max_delta_per_cycle=0.06)
 
-        # Tuning
-        self.target_speed = 70.0
-        self.min_speed = 0.0
-        self.max_speed = 85.0
-        self.kp_steer = 0.60
-        self.kd_steer = 0.50
+        # PID lateral
+        self.kp_steer = 1.20
+        self.ki_steer = 0.015
+        self.kd_steer = 0.40
+        self._steer_integral = 0.0
         self.prev_steer_error = 0.0
-        self.kp_speed = 0.012
+
+        # Speed control
+        self.kp_speed = 0.008
+        self.target_speed = 45.0   # slower = more time to correct
+        self.min_speed = 0.0
+        self.max_speed = 65.0
 
         self._last_update = time.time()
         self._frame_counter = 0
         self._lost_lane_frames = 0
         self._status_info = {}
 
-        # Crash / stuck recovery
+        # Recovery
         self._collision_frames = 0
         self._recover_timer = 0
         self._last_lane_center = None
         self._stuck_timer = 0.0
-
-        # Reduce log spam
-        self._log_every = 15  # log summary every 15 frames (~0.5s)
+        self._log_every = 15
 
     def toggle(self):
         self.enabled = not self.enabled
@@ -275,6 +263,8 @@ class Autopilot:
             self.state = "IDLE"
             self.steer_limiter.reset(0.0)
             self.throttle_limiter.reset(0.0)
+            self._steer_integral = 0.0
+            self.prev_steer_error = 0.0
             self._collision_frames = 0
             self._recover_timer = 0
         else:
@@ -304,7 +294,6 @@ class Autopilot:
         else:
             self._collision_frames = max(0, self._collision_frames - 2)
 
-        # Stuck detection: lane center barely moving while obstacle very close
         if lane_center is not None:
             if self._last_lane_center is not None:
                 if abs(lane_center - self._last_lane_center) < 15 and closest_obstacle > 0.85:
@@ -315,7 +304,7 @@ class Autopilot:
         else:
             self._stuck_timer += dt
 
-        # State machine transitions
+        # State machine
         if self.state == "RECOVER":
             self._recover_timer -= 1
             if self._recover_timer <= 0:
@@ -325,13 +314,14 @@ class Autopilot:
                 self._stuck_timer = 0.0
                 self._collision_frames = 0
         elif self._collision_frames > 20 or self._stuck_timer > 2.5:
-            print(f"[AP] CRASH/STUCK detected -> RECOVER (collision={self._collision_frames}, stuck={self._stuck_timer:.1f}s)")
+            print(f"[AP] CRASH/STUCK -> RECOVER")
             self.state = "RECOVER"
-            self._recover_timer = 90  # ~3 seconds @ 30Hz
+            self._recover_timer = 90
             self.throttle_limiter.reset(0.0)
             self.steer_limiter.reset(0.0)
+            self._steer_integral = 0.0
         elif self.state == "EMERGENCY":
-            pass  # stay until toggled off/on
+            pass
         elif obstacle_brake > 0.02:
             self.state = "BRAKING"
         else:
@@ -341,31 +331,38 @@ class Autopilot:
         # ── Speed Planning ──
         target = self.target_speed
 
-        # Curve slowdown
         curve_factor = 1.0
-        if abs(lane_heading) > 0.30:
-            curve_factor = 0.55
-        elif abs(lane_heading) > 0.15:
-            curve_factor = 0.78
-        elif abs(gps_steer_bias or 0) > 0.28:
+        if abs(lane_heading) > 0.35:
+            curve_factor = 0.45
+        elif abs(lane_heading) > 0.18:
             curve_factor = 0.70
+        elif abs(gps_steer_bias or 0) > 0.30:
+            curve_factor = 0.65
         target *= curve_factor
 
-        # Obstacle slowdown
         if obstacle_brake > 0.02 and self.state not in ("RECOVER", "EMERGENCY"):
             target *= (1.0 - min(1.0, obstacle_brake * 1.2))
 
         target = max(self.min_speed, min(self.max_speed, target))
         current_speed = self._estimate_speed(gps_info)
 
-        # ── Lateral Control ──
+        # ── Lateral Control (PID) ──
         steer = 0.0
         if lane_center is not None:
             error = (lane_center - w / 2.0) / (w / 2.0 + 1e-6)
-            if abs(error) < 0.03:
+
+            # Tighter dead zone: respond to smaller offsets
+            if abs(error) < 0.015:
                 error = 0.0
+
+            # Integral with anti-windup
+            self._steer_integral += error * dt
+            self._steer_integral = np.clip(self._steer_integral, -0.30, 0.30)
+
             derivative = (error - self.prev_steer_error) / max(dt, 0.001)
-            steer = self.kp_steer * error + self.kd_steer * derivative
+            steer = (self.kp_steer * error +
+                     self.ki_steer * self._steer_integral +
+                     self.kd_steer * derivative)
             self.prev_steer_error = error
             self._lost_lane_frames = 0
         else:
@@ -378,7 +375,7 @@ class Autopilot:
         # Blend GPS
         if gps_steer_bias is not None:
             lane_conf = 1.0 if lane_center is not None else 0.0
-            alpha = 0.22 if lane_conf else 0.80
+            alpha = 0.20 if lane_conf else 0.75
             steer = (1.0 - alpha) * steer + alpha * gps_steer_bias
 
         steer = float(np.clip(steer, -1.0, 1.0))
@@ -388,13 +385,11 @@ class Autopilot:
         throttle = self.kp_speed * speed_error
 
         if self.state == "RECOVER":
-            # Reverse straight out
             throttle = -1.0
             steer = 0.0
         elif self.state == "EMERGENCY":
             throttle = -1.0
         elif obstacle_brake > 0.90 or closest_obstacle > 0.96:
-            # Immediate hard brake, bypass gentle slowdown
             throttle = -1.0
         elif closest_obstacle > 0.65 and speed_error > 0:
             throttle = min(throttle, 0.0)
@@ -404,9 +399,7 @@ class Autopilot:
         # ── Smooth & Apply ──
         smooth_steer = self.steer_limiter.update(steer)
 
-        # For throttle: if emergency/recover/braking hard, allow faster slew down
         if self.state in ("RECOVER", "EMERGENCY") or obstacle_brake > 0.85:
-            # Bypass rate limiter for rapid braking
             smooth_throttle = throttle
             self.throttle_limiter.reset(throttle)
         else:
@@ -414,7 +407,7 @@ class Autopilot:
 
         self.vc.set_controls(smooth_steer, smooth_throttle)
 
-        # Logging (throttled)
+        # Logging
         if self._frame_counter % self._log_every == 0:
             lc = f"{lane_center:.0f}" if lane_center is not None else "--"
             print(f"[AP] {self.state:8s} S={smooth_steer:+.2f} T={smooth_throttle:+.2f} "
