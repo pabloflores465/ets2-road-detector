@@ -3,13 +3,13 @@
 ETS2 Navigation & Mirrors Overlay
 
 Extrae y muestra en ventana flotante siempre encima:
-  - Panel GPS / Route Advisor (esquina inferior derecha)
+  - Panel GPS / Route Advisor (esquina inferior derecha) con deteccion de:
+      * Flecha azul  = posicion actual
+      * Linea roja   = ruta a seguir
+      * Flechas verdes = direccion del giro
+      * Texto de kilometraje
   - Retrovisor izquierdo (esquina superior izquierda)
   - Retrovisor derecho (esquina superior derecha)
-
-NOTA: Esta clase se usa dentro de un Toplevel (ventana secundaria)
-      que comparte el intérprete Tcl con la ventana principal.
-      Esto evita problemas de thread-safety y garbage collection de PhotoImage.
 """
 
 import threading
@@ -44,13 +44,22 @@ REGIONS = {
     },
 }
 
-SCALE = 1.0
+# Escala de salida del GPS (0.5 = mitad de tamano)
+GPS_SCALE = 0.5
+
+# Mostrar retrovisores?
 SHOW_MIRRORS = True
 
+# Colores HSV para deteccion en el GPS (OpenCV HSV)
+# [H_min, H_max, S_min, S_max, V_min, V_max]
+HSV_RANGES = {
+    "blue":   ([100, 140,  80, 255, 100, 255], (255, 0,   0)),   # flecha azul
+    "red":    ([0,   10,   80, 255, 100, 255], (0,   0, 255)),   # ruta roja
+    "red2":   ([170, 180,  80, 255, 100, 255], (0,   0, 255)),   # ruta roja (envuelve)
+    "green":  ([35,  85,  80, 255, 100, 255], (0, 255,   0)),   # flechas direccion
+}
 
-# -----------------------------------------------------------------------------
-# UTILIDADES
-# -----------------------------------------------------------------------------
+
 def get_region_frame(frame, region_spec):
     h, w = frame.shape[:2]
     x = int(region_spec["left"] * w)
@@ -64,19 +73,99 @@ def get_region_frame(frame, region_spec):
     return frame[y:y + rh, x:x + rw]
 
 
+def process_gps(frame_bgr):
+    """
+    Detecta y resalta elementos del panel GPS:
+      - Flecha azul  (posicion)
+      - Linea roja   (ruta)
+      - Flechas verdes (direccion)
+      - Area de texto (kilometraje)
+    Retorna frame procesado + dict con info detectada.
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return frame_bgr, {}
+
+    result = frame_bgr.copy()
+    h, w = result.shape[:2]
+    info = {"blue": 0, "red": 0, "green": 0}
+
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    # --- Azul (flecha posicion) ---
+    lower = np.array(HSV_RANGES["blue"][0][:3])
+    upper = np.array(HSV_RANGES["blue"][0][3:])
+    mask_blue = cv2.inRange(hsv, lower, upper)
+    contours, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 20:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            cv2.rectangle(result, (x, y), (x + bw, y + bh), (255, 0, 0), 2)
+            cv2.putText(result, "POS", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+            info["blue"] += 1
+
+    # --- Rojo (ruta) ---
+    lower1 = np.array(HSV_RANGES["red"][0][:3])
+    upper1 = np.array(HSV_RANGES["red"][0][3:])
+    lower2 = np.array(HSV_RANGES["red2"][0][:3])
+    upper2 = np.array(HSV_RANGES["red2"][0][3:])
+    mask_red = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+    contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 30:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 0, 255), 2)
+            info["red"] += 1
+
+    # --- Verde (flechas direccion) ---
+    lower = np.array(HSV_RANGES["green"][0][:3])
+    upper = np.array(HSV_RANGES["green"][0][3:])
+    mask_green = cv2.inRange(hsv, lower, upper)
+    contours, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 20:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+            cv2.putText(result, "DIR", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            info["green"] += 1
+
+    # --- Texto / Info panel (area blanca en la parte superior del GPS) ---
+    # Detectar regiones con alto brillo (texto blanco)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    _, mask_text = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    # Erosion para eliminar ruido
+    kernel = np.ones((3, 3), np.uint8)
+    mask_text = cv2.erode(mask_text, kernel, iterations=1)
+    contours, _ = cv2.findContours(mask_text, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    text_boxes = []
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw > 30 and bh > 8 and y < h * 0.25:  # solo texto en la parte superior
+            text_boxes.append((x, y, bw, bh))
+    # Dibujar recuadro amarillo alrededor del bloque de texto
+    if text_boxes:
+        xs = [b[0] for b in text_boxes]
+        ys = [b[1] for b in text_boxes]
+        x2s = [b[0] + b[2] for b in text_boxes]
+        y2s = [b[1] + b[3] for b in text_boxes]
+        cv2.rectangle(result, (min(xs) - 2, min(ys) - 2), (max(x2s) + 2, max(y2s) + 2), (0, 255, 255), 2)
+        cv2.putText(result, "INFO", (min(xs), min(ys) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+    return result, info
+
+
 # -----------------------------------------------------------------------------
 # NAV OVERLAY (para usar dentro de un Toplevel)
 # -----------------------------------------------------------------------------
 class NavOverlayManager:
-    """Gestiona el contenido de la ventana de navegacion dentro de un Toplevel."""
-
     def __init__(self, toplevel, win_info):
         self.root = toplevel
         self.win_info = win_info
         self._win_lock = threading.Lock()
         self._running = True
 
-        # Boton X rojo
         self.btn_close = Button(
             self.root, text="X", command=self.on_close,
             bg="#cc0000", fg="white", font=("Arial", 8, "bold"),
@@ -100,7 +189,6 @@ class NavOverlayManager:
         )
         self.lbl_info.grid(row=2, column=0, columnspan=2, sticky="w")
 
-        # Arrastre
         self.root.bind("<Button-1>", self._start_move)
         self.root.bind("<B1-Motion>", self._on_move)
         self._drag_x = 0
@@ -110,9 +198,9 @@ class NavOverlayManager:
         self.gps_img = None
         self.left_img = None
         self.right_img = None
+        self.gps_info = {}
         self.fps = 0
 
-        # PhotoImage references para evitar GC
         self._tk_gps = None
         self._tk_left = None
         self._tk_right = None
@@ -151,6 +239,9 @@ class NavOverlayManager:
             left_frame = get_region_frame(frame_bgr, REGIONS["mirror_left"]) if SHOW_MIRRORS else None
             right_frame = get_region_frame(frame_bgr, REGIONS["mirror_right"]) if SHOW_MIRRORS else None
 
+            # Procesar GPS: detectar colores y resaltar
+            gps_processed, gps_info = process_gps(gps_frame)
+
             frame_count += 1
             now = time.time()
             if now - prev_time >= 1.0:
@@ -159,10 +250,11 @@ class NavOverlayManager:
                 prev_time = now
 
             with self._lock:
-                self.gps_img = gps_frame
+                self.gps_img = gps_processed
                 if SHOW_MIRRORS:
                     self.left_img = left_frame
                     self.right_img = right_frame
+                self.gps_info = gps_info
                 self.fps = fps_display
 
             elapsed = time.time() - loop_start
@@ -187,14 +279,14 @@ class NavOverlayManager:
             left = self.left_img.copy() if SHOW_MIRRORS and self.left_img is not None else None
             right = self.right_img.copy() if SHOW_MIRRORS and self.right_img is not None else None
             fps = self.fps
+            gps_info = dict(self.gps_info)
 
         total_w = 0
         total_h = 0
 
-        # GPS
+        # GPS: escalar a tamano pequeno
         if gps is not None:
-            if SCALE != 1.0:
-                gps = cv2.resize(gps, None, fx=SCALE, fy=SCALE, interpolation=cv2.INTER_AREA)
+            gps = cv2.resize(gps, None, fx=GPS_SCALE, fy=GPS_SCALE, interpolation=cv2.INTER_AREA)
             gps_pil = self._pil_from_frame(gps)
             if gps_pil:
                 self._tk_gps = ImageTk.PhotoImage(image=gps_pil)
@@ -205,21 +297,27 @@ class NavOverlayManager:
         # Retrovisores
         if SHOW_MIRRORS:
             if left is not None:
-                left = cv2.resize(left, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+                left = cv2.resize(left, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_AREA)
                 left_pil = self._pil_from_frame(left)
                 if left_pil:
                     self._tk_left = ImageTk.PhotoImage(image=left_pil)
                     self.lbl_left.configure(image=self._tk_left)
 
             if right is not None:
-                right = cv2.resize(right, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+                right = cv2.resize(right, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_AREA)
                 right_pil = self._pil_from_frame(right)
                 if right_pil:
                     self._tk_right = ImageTk.PhotoImage(image=right_pil)
                     self.lbl_right.configure(image=self._tk_right)
 
-        self.lbl_info.configure(text=f"Nav FPS:{fps} | Arrastra para mover | X para cerrar")
+        # Info bar
+        b = gps_info.get("blue", 0)
+        r = gps_info.get("red", 0)
+        g = gps_info.get("green", 0)
+        info_text = f"Nav FPS:{fps} | pos:{b} ruta:{r} dir:{g}"
+        self.lbl_info.configure(text=info_text)
 
+        # Geometria
         gps_w = gps.shape[1] if gps is not None else 0
         gps_h = gps.shape[0] if gps is not None else 0
         if SHOW_MIRRORS and left is not None:
