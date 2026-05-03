@@ -26,7 +26,7 @@ from PIL import Image, ImageTk
 # -----------------------------------------------------------------------------
 FPS_LIMIT = 30
 SHOW_LANES = True
-DISPLAY_MODE = "overlay"   # "overlay" | "mask" | "split"
+DISPLAY_MODE = "overlay"   # "overlay" | "mask" | "split" | "debug"
 
 ROAD_ALPHA = 1.0
 LANE_ALPHA = 1.0
@@ -229,13 +229,22 @@ def postprocess(da_seg_out, ll_seg_out, meta):
     height, width, r, dw, dh, new_unpad_w, new_unpad_h = meta
     da = da_seg_out[:, :, dh:dh + new_unpad_h, dw:dw + new_unpad_w]
     ll = ll_seg_out[:, :, dh:dh + new_unpad_h, dw:dw + new_unpad_w]
+
+    # Probabilidad de clase "road" / "lane" (channel 1)
+    da_prob = da[0, 1]  # (H, W)
+    ll_prob = ll[0, 1]  # (H, W)
+
     da_mask = np.argmax(da, axis=1)[0]
     ll_mask = np.argmax(ll, axis=1)[0]
+
     da_mask = cv2.resize(da_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
     ll_mask = cv2.resize(ll_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
-    da_mask = (da_mask > 0.3).astype(np.uint8)
-    ll_mask = (ll_mask > 0.3).astype(np.uint8)
-    return da_mask, ll_mask
+    da_prob = cv2.resize(da_prob.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+    ll_prob = cv2.resize(ll_prob.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+
+    da_mask = (da_mask > 0.15).astype(np.uint8)
+    ll_mask = (ll_mask > 0.15).astype(np.uint8)
+    return da_mask, ll_mask, da_prob, ll_prob
 
 
 # -----------------------------------------------------------------------------
@@ -303,6 +312,8 @@ class OverlayWindow:
         skip_counter = 0
         last_da_mask = None
         last_ll_mask = None
+        last_da_prob = None
+        last_ll_prob = None
 
         while self._running:
             loop_start = time.time()
@@ -339,27 +350,42 @@ class OverlayWindow:
                     ["det_out", "drive_area_seg", "lane_line_seg"],
                     {"images": inp},
                 )
-                last_da_mask, last_ll_mask = postprocess(da_seg_out, ll_seg_out, meta)
+                last_da_mask, last_ll_mask, last_da_prob, last_ll_prob = postprocess(da_seg_out, ll_seg_out, meta)
 
             da_mask = last_da_mask
             ll_mask = last_ll_mask
+            da_prob = last_da_prob
+            ll_prob = last_ll_prob
 
             if da_mask is None:
-                # Todavia no hay inferencia lista
                 time.sleep(0.05)
                 continue
 
             # Asegurar que las mascaras coincidan con el frame actual
-            # (puede haber diferencia de 1px por redondeo entre frames)
             if da_mask.shape[:2] != (h, w):
                 da_mask = cv2.resize(da_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
-                da_mask = (da_mask > 0.5).astype(np.uint8)
+                da_mask = (da_mask > 0.15).astype(np.uint8)
+                if da_prob is not None:
+                    da_prob = cv2.resize(da_prob.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
             if ll_mask is not None and ll_mask.shape[:2] != (h, w):
                 ll_mask = cv2.resize(ll_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
-                ll_mask = (ll_mask > 0.5).astype(np.uint8)
+                ll_mask = (ll_mask > 0.15).astype(np.uint8)
+                if ll_prob is not None:
+                    ll_prob = cv2.resize(ll_prob.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
 
             # ---- CONSTRUIR VISUALIZACION ----
-            if self._display_mode == "mask":
+            if self._display_mode == "debug":
+                result = frame_bgr.copy()
+                if da_prob is not None:
+                    heatmap = (np.clip(da_prob, 0, 1) * 255).astype(np.uint8)
+                    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+                    result = cv2.addWeighted(result, 0.4, heatmap_color, 0.6, 0)
+                if ll_prob is not None and SHOW_LANES:
+                    lane_heatmap = (np.clip(ll_prob, 0, 1) * 255).astype(np.uint8)
+                    lane_color = cv2.applyColorMap(lane_heatmap, cv2.COLORMAP_HOT)
+                    result = cv2.addWeighted(result, 0.7, lane_color, 0.3, 0)
+
+            elif self._display_mode == "mask":
                 result = np.zeros((h, w, 3), dtype=np.uint8)
                 result[da_mask == 1] = COLOR_ROAD
                 if SHOW_LANES:
@@ -377,16 +403,16 @@ class OverlayWindow:
 
             else:  # overlay
                 result = frame_bgr.copy()
-                # Carretera en verde opaco
                 result[da_mask == 1] = COLOR_ROAD
-                # Lineas en rojo opaco
                 if SHOW_LANES:
                     result[ll_mask == 1] = COLOR_LANE
 
-            # Si no detecta nada, mostrar aviso en la imagen
             if np.sum(da_mask) == 0 and np.sum(ll_mask) == 0:
                 cv2.putText(result, "NO DETECTA", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+            da_max = float(np.max(da_prob)) if da_prob is not None else 0.0
+            ll_max = float(np.max(ll_prob)) if ll_prob is not None else 0.0
 
             # ---- FPS ----
             frame_count += 1
@@ -399,6 +425,10 @@ class OverlayWindow:
             with self._lock:
                 self.frame_result = result
                 self.fps = fps_display
+                self.road_pixels = int(np.sum(da_mask))
+                self.lane_pixels = int(np.sum(ll_mask))
+                self.da_max = da_max
+                self.ll_max = ll_max
 
             elapsed = time.time() - loop_start
             sleep_time = max(0, (1.0 / FPS_LIMIT) - elapsed)
@@ -434,9 +464,11 @@ class OverlayWindow:
             self.lbl_main.configure(image=imgtk)
             self.lbl_main.place(x=0, y=0, width=new_w, height=new_h)
 
-            road_pixels = int(np.sum(da_mask)) if da_mask is not None else 0
-            lane_pixels = int(np.sum(ll_mask)) if ll_mask is not None else 0
-            info_text = f"FPS:{fps} | res:{MODEL_RES} | road:{road_pixels}px | lane:{lane_pixels}px"
+            road_pixels = getattr(self, 'road_pixels', 0)
+            lane_pixels = getattr(self, 'lane_pixels', 0)
+            da_max = getattr(self, 'da_max', 0.0)
+            ll_max = getattr(self, 'll_max', 0.0)
+            info_text = f"FPS:{fps} | road:{road_pixels}px | da:{da_max:.2f} | ll:{ll_max:.2f}"
             self.lbl_info.configure(text=info_text)
             self.lbl_info.place(x=0, y=new_h, width=new_w, height=18)
 
