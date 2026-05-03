@@ -143,7 +143,10 @@ class CoralOverlayWindow:
         self.root = tk.Tk()
         self.root.title("ETS2 Coral TPU Detection")
         self.root.attributes("-topmost", True)
-        self.root.overrideredirect(True)
+        try:
+            self.root.overrideredirect(True)
+        except tk.TclError:
+            self.root.wm_attributes("-type", "splash")
         self.root.configure(bg="black", highlightthickness=0)
 
         self.btn_close = Button(

@@ -77,7 +77,11 @@ class NavOverlayWindow:
         self.root = tk.Tk()
         self.root.title("ETS2 Nav + Mirrors")
         self.root.attributes("-topmost", True)
-        self.root.overrideredirect(True)
+        try:
+            self.root.overrideredirect(True)
+        except tk.TclError:
+            # macOS tkinter bug: usar wm_attributes como fallback
+            self.root.wm_attributes("-type", "splash")
         self.root.configure(bg="black", highlightthickness=0)
 
         # Boton X rojo
