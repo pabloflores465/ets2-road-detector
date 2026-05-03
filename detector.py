@@ -493,16 +493,17 @@ class MainWindow:
                 ap_state = ap_status.get("state", "?")
                 ap_steer = ap_status.get("steering", 0)
                 ap_thr = ap_status.get("throttle", 0)
-                lc = ap_status.get("lane_center")
-                hud = f"AP {ap_state} S:{ap_steer:+.2f} T:{ap_thr:.2f}"
+                lane_status = ap_status.get("lane_status", "?")
+                lane_offset = ap_status.get("lane_offset", 0)
+                lane_rows = ap_status.get("lane_rows", 0)
+                hud = f"AP {ap_state} S:{ap_steer:+.2f} T:{ap_thr:.2f} {lane_status}"
                 cv2.putText(result, hud, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
-                # Visual lane center guide (original style)
-                if lc is not None:
-                    cv2.circle(result, (int(lc), h - 20), 8, (0, 255, 0), 2)
-                    cv2.line(result, (w // 2, h - 20), (int(lc), h - 20), (0, 255, 0), 2)
-                # Target center line
-                cv2.line(result, (w // 2, h - 40), (w // 2, h), (255, 0, 0), 2)
+                # Use Chosun debug image if available
+                debug_img = ap_status.get("debug_img")
+                if debug_img is not None:
+                    # Replace result with debug image for better visualization
+                    result = debug_img
 
                 # Log frame + autopilot state for review
                 if self.nav_win and self.nav_win.last_gps_crop is not None:

@@ -1,64 +1,17 @@
 """
 autopilot.py
-Ultra-simple autonomous driving for ETS2.
+Autonomous driving for ETS2 using ChosunTruck lane detection approach.
 
-Strategy: KISS (Keep It Simple, Stupid)
-  1. Detect lane center from YOLOP ll_seg (original method that worked)
-  2. error = lane_center - image_center
-  3. steer = error * 2.0  (NO rate limiter, NO EMA, NO PID)
-  4. throttle = 1.0 (always accelerate unless obstacle)
-  5. Never reverse in normal driving
+Pipeline:
+  1. Capture frame
+  2. ChosunLaneDetector: IPM + Sobel + horizontal scan -> steering
+  3. Constant throttle, reduce for curves/obstacles
+  4. Send to VehicleController
 """
 import time
-import cv2
 import numpy as np
 from vehicle_control import VehicleController
-
-
-class LaneAnalyzer:
-    """Original lane detection that worked. Extract lane center from ll_seg."""
-
-    def __init__(self):
-        self.prev_center = None
-
-    def analyze(self, ll_seg, img_width: int, img_height: int):
-        if ll_seg is None or ll_seg.size == 0:
-            return self.prev_center
-
-        prob = ll_seg[0, 1, :, :]
-        h, w = prob.shape
-        scale_x = img_width / w
-
-        y_ratios = [0.55, 0.65, 0.75, 0.85, 0.92]
-        centers = []
-        mid = w // 2
-        gap = int(w * 0.06)
-
-        for yr in y_ratios:
-            y = int(h * yr)
-            if y >= h:
-                continue
-            row = prob[y, :]
-            xs = np.where(row > 0.40)[0]
-            if len(xs) < 3:
-                continue
-
-            left = xs[xs < mid - gap]
-            right = xs[xs > mid + gap]
-
-            if len(left) > 0 and len(right) > 0:
-                centers.append((np.median(left) + np.median(right)) / 2.0 * scale_x)
-            elif len(right) > 0:
-                centers.append((np.median(right) - w * 0.22) * scale_x)
-            elif len(left) > 0:
-                centers.append((np.median(left) + w * 0.22) * scale_x)
-
-        if not centers:
-            return self.prev_center
-
-        lane_center = float(np.median(centers))
-        self.prev_center = lane_center
-        return lane_center
+from chosun_lane import ChosunLaneDetector
 
 
 class ObstacleAssessor:
@@ -110,6 +63,7 @@ class GPSNavigator:
         if gps_crop is None or gps_crop.size == 0:
             return self.prev_bias
 
+        import cv2
         h, w = gps_crop.shape[:2]
         hsv = cv2.cvtColor(gps_crop, cv2.COLOR_BGR2HSV)
         mask = (cv2.inRange(hsv, np.array([0, 30, 30], dtype=np.uint8),
@@ -134,7 +88,7 @@ class Autopilot:
         self.enabled = False
         self.state = "IDLE"
 
-        self.lane_analyzer = LaneAnalyzer()
+        self.lane_detector = None  # initialized on first frame
         self.obstacle_assessor = ObstacleAssessor()
         self.gps_nav = GPSNavigator()
 
@@ -144,7 +98,6 @@ class Autopilot:
         self._status_info = {}
         self._log_every = 15
 
-        # Recovery
         self._recover_timer = 0
 
     def toggle(self):
@@ -171,18 +124,25 @@ class Autopilot:
 
         h, w = raw_bgr.shape[:2]
 
-        # ── Perception ──
-        lane_center = self.lane_analyzer.analyze(ll_seg, w, h)
+        # Initialize lane detector on first frame
+        if self.lane_detector is None or self.lane_detector.w != w or self.lane_detector.h != h:
+            self.lane_detector = ChosunLaneDetector(img_width=w, img_height=h)
+
+        # ── Lane Detection (Chosun approach) ──
+        steer, debug_img, lane_info = self.lane_detector.detect(raw_bgr)
+
+        # ── Obstacles ──
         obstacle_risk = self.obstacle_assessor.assess(coral_dets, h, w)
+
+        # ── GPS fallback ──
         gps_bias = self.gps_nav.analyze(gps_crop)
 
-        # ── Lost lane detection ──
-        if lane_center is None:
+        # ── State machine ──
+        if lane_info.get("status") != "ok":
             self._lost_lane_frames += 1
         else:
             self._lost_lane_frames = 0
 
-        # ── State machine ──
         if self.state == "RECOVER":
             self._recover_timer -= 1
             if self._recover_timer <= 0:
@@ -198,21 +158,15 @@ class Autopilot:
             if self.state == "BRAKING":
                 self.state = "ACTIVE"
 
-        # ── Steering (SIMPLE: direct proportional) ──
-        steer = 0.0
-        if lane_center is not None:
-            error = (lane_center - w / 2.0) / (w / 2.0 + 1e-6)
-            # Pure proportional, strong gain
-            steer = error * 2.0
-            # Boost small corrections
-            if 0.01 < abs(steer) < 0.10:
-                steer = np.sign(steer) * 0.12
-        elif gps_bias is not None:
+        # ── Steering ──
+        if self._lost_lane_frames > 15 and gps_bias is not None:
+            # Use GPS when lanes lost for >0.5s
             steer = gps_bias
 
+        # Clamp and boost small corrections
         steer = float(np.clip(steer, -1.0, 1.0))
 
-        # ── Throttle (SIMPLE: constant) ──
+        # ── Throttle ──
         if self.state == "RECOVER":
             throttle = -1.0
             steer = 0.0
@@ -221,26 +175,39 @@ class Autopilot:
         elif obstacle_risk > 0.40:
             throttle = 0.40
         else:
-            throttle = 1.0
+            # Slow down in curves
+            if abs(steer) > 0.35:
+                throttle = 0.65
+            elif abs(steer) > 0.15:
+                throttle = 0.85
+            else:
+                throttle = 1.0
 
         throttle = float(np.clip(throttle, 0.0, 1.0))
 
-        # ── Apply directly (NO rate limiters on steering) ──
+        # ── Apply ──
         self.vc.set_controls(steer, throttle)
 
         # Logging
         if self._frame_counter % self._log_every == 0:
-            lc = f"{lane_center:.0f}" if lane_center else "--"
-            print(f"[AP] {self.state:8s} S={steer:+.2f} T={throttle:.2f} lane={lc} obs={obstacle_risk:.2f} keys={self.vc.active_keys}")
+            status = lane_info.get("status", "?")
+            offset = lane_info.get("offset", 0)
+            rows = lane_info.get("rows_found", 0)
+            print(f"[AP] {self.state:8s} S={steer:+.2f} T={throttle:.2f} "
+                  f"lane={status} off={offset} rows={rows} obs={obstacle_risk:.2f} "
+                  f"keys={self.vc.active_keys}")
 
         self._status_info = {
             "state": self.state,
             "steering": round(steer, 2),
             "throttle": round(throttle, 2),
-            "lane_center": round(lane_center, 1) if lane_center else None,
+            "lane_status": lane_info.get("status"),
+            "lane_offset": lane_info.get("offset"),
+            "lane_rows": lane_info.get("rows_found"),
             "obstacle_risk": round(obstacle_risk, 2),
             "gps_bias": round(gps_bias, 2) if gps_bias is not None else None,
             "keys": self.vc.active_keys,
+            "debug_img": debug_img,
         }
         return self._status_info
 
