@@ -28,5 +28,11 @@ print('OK')
     uv pip install https://github.com/google-coral/pycoral/releases/download/v2.0.0/pycoral-2.0.0-cp39-cp39-macosx_12_0_arm64.whl
 }
 
-echo "[INFO] Iniciando detector unificado (YOLOP + Coral TPU)..."
+# Descargar modelo ETSAuto si no existe
+if [ ! -f "etsauto_models/bevlanedet.onnx" ]; then
+    echo "[INFO] Descargando modelo ETSAuto bevlanedet.onnx (~126MB)..."
+    bash etsauto_models/download_model.sh
+fi
+
+echo "[INFO] Iniciando detector unificado (ETSAuto + Coral TPU)..."
 uv run python3 detector.py

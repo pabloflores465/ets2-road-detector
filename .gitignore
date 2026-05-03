@@ -27,3 +27,4 @@ venv39/
 
 # Session captures (frames + CSV logs)
 captures/
+*.onnx
