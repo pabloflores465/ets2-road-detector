@@ -145,15 +145,28 @@ class ETSAutoLaneDetector:
     def preprocess(self, img):
         """img: BGR frame from ETS2"""
         h, w = img.shape[:2]
-        # ETSAuto does img[50:640, :, :] on ~640px tall images.
-        # They remove top 50px (sky) and KEEP the rest including dashboard.
-        # Proportional: remove top 8%, keep everything else.
-        crop_top = int(h * 50 / 640)  # proportional to ETSAuto's 50px crop
-        img = img[crop_top:, :, :]  # keep bottom (dashboard included!)
+
+        # Center crop to 16:9 aspect ratio (remove side bars if any)
+        target_ratio = 16.0 / 9.0
+        current_ratio = w / h
+        if current_ratio > target_ratio:
+            new_w = int(h * target_ratio)
+            start_x = (w - new_w) // 2
+            img = img[:, start_x:start_x + new_w, :]
+        elif current_ratio < target_ratio:
+            new_h = int(w / target_ratio)
+            start_y = (h - new_h) // 2
+            img = img[start_y:start_y + new_h, :, :]
+
+        h, w = img.shape[:2]
+
+        # ETSAuto crop: img[50:640, :, :] on images ~640px tall.
+        # Proportional crop for variable sizes.
+        crop_top = int(h * 50 / 640)
+        crop_bottom = int(h * 590 / 640)
+        img = img[crop_top:crop_bottom, :, :]
+
         img = cv2.resize(img, (self.input_shape[1], self.input_shape[0]))
-        # Model trained with Albumentations on images loaded by OpenCV (BGR)
-        # Albumentations Normalize applies per-channel WITHOUT swapping.
-        # So we keep BGR and normalize directly.
         img = img.astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)

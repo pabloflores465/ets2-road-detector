@@ -390,7 +390,7 @@ class MainWindow:
             with self._win_lock:
                 info = dict(self.win_info)
 
-            frame_bgr = capture_window_quartz(info["id"]) if info.get("id") else capture_fallback(info)
+            frame_bgr = capture_window_quartz(info["id"], info.get("bounds")) if info.get("id") else capture_fallback(info)
             if frame_bgr is None:
                 time.sleep(0.2)
                 continue

@@ -57,11 +57,13 @@ def find_ets2_window():
                     "top": int(b.get("Y", 0)),
                     "width": width,
                     "height": height,
+                    "bounds": b,
                 }
     return None
 
 
-def capture_window_quartz(win_id):
+def capture_window_quartz(win_id, bounds=None):
+    """Capture window and auto-crop macOS window chrome if detected."""
     try:
         import Quartz
     except ImportError:
@@ -71,7 +73,7 @@ def capture_window_quartz(win_id):
             Quartz.CGRectNull,
             Quartz.kCGWindowListOptionIncludingWindow,
             win_id,
-            Quartz.kCGWindowImageBoundsIgnoreFraming
+            Quartz.kCGWindowImageDefault
         )
         if image is None:
             return None
@@ -85,7 +87,34 @@ def capture_window_quartz(win_id):
         else:
             arr = buf[:height * bytesperrow].reshape((height, bytesperrow))
             arr = arr[:, :width * 4].reshape((height, width, 4))
-        return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+        frame = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+
+        # Auto-crop macOS window chrome (title bar ~22px, borders ~1px)
+        h, w = frame.shape[:2]
+        if bounds:
+            # Use Quartz bounds to compute content region
+            bh = int(bounds.get("Height", h))
+            bw = int(bounds.get("Width", w))
+            # If captured image is taller than bounds, we have title bar
+            if h > bh + 5:
+                offset_y = (h - bh) // 2
+                frame = frame[offset_y:offset_y+bh, :, :]
+            # If captured image is wider than bounds, we have side borders
+            if w > bw + 5:
+                offset_x = (w - bw) // 2
+                frame = frame[:, offset_x:offset_x+bw, :]
+        else:
+            # Heuristic: detect title bar by checking if top rows are uniform
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            top_std = np.std(gray[:30, :], axis=1)
+            if np.mean(top_std[:10]) < 8:  # likely title bar
+                # Find where content starts (std increases)
+                for y in range(10, min(40, h)):
+                    if top_std[y] > 15:
+                        frame = frame[y:, :, :]
+                        break
+
+        return frame
     except Exception as e:
         print(f"[WARN] Quartz capture failed: {e}")
         return None
