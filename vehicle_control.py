@@ -86,7 +86,7 @@ class VehicleController:
                 time.sleep(sleep)
 
     def _apply_axis(self, name, value, neg_key, pos_key):
-        dead = 0.05
+        dead = 0.03
         abs_val = abs(value)
 
         if abs_val < dead:
@@ -98,12 +98,13 @@ class VehicleController:
         inactive = neg_key if value > 0 else pos_key
         self._release(inactive)
 
-        if abs_val > 0.55:
-            duty = 1
-        elif abs_val > 0.25:
-            duty = 2
+        # More aggressive PWM: hold keys longer at lower intensities
+        if abs_val > 0.35:
+            duty = 1   # hold constantly (strong correction)
+        elif abs_val > 0.12:
+            duty = 2   # 50% duty (moderate)
         else:
-            duty = 4
+            duty = 4   # 25% duty (gentle micro-adjust)
 
         if self._cycle_counter % duty == 0:
             self._press(active)

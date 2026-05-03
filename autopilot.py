@@ -239,17 +239,17 @@ class Autopilot:
         self.throttle_limiter = RateLimiter(max_delta_per_cycle=0.06)
 
         # PID lateral
-        self.kp_steer = 1.20
-        self.ki_steer = 0.015
-        self.kd_steer = 0.40
+        self.kp_steer = 1.60
+        self.ki_steer = 0.025
+        self.kd_steer = 0.35
         self._steer_integral = 0.0
         self.prev_steer_error = 0.0
 
         # Speed control
-        self.kp_speed = 0.008
-        self.target_speed = 45.0   # slower = more time to correct
+        self.kp_speed = 0.015
+        self.target_speed = 65.0   # faster on straights
         self.min_speed = 0.0
-        self.max_speed = 65.0
+        self.max_speed = 85.0
 
         self._last_update = time.time()
         self._frame_counter = 0
@@ -364,8 +364,8 @@ class Autopilot:
         if lane_center is not None:
             error = (lane_center - w / 2.0) / (w / 2.0 + 1e-6)
 
-            # Tighter dead zone: respond to smaller offsets
-            if abs(error) < 0.015:
+            # Tight dead zone: ignore tiny jitter but catch small drifts
+            if abs(error) < 0.008:
                 error = 0.0
 
             # Integral with anti-windup
