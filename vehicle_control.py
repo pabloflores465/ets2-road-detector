@@ -101,10 +101,10 @@ class VehicleController:
         abs_val = abs(value)
 
         if abs_val < dead:
-            # In dead zone: if key not being held, release both
-            if neg_key not in self._pressed_keys:
+            # In dead zone: release both keys if held
+            if neg_key in self._pressed_keys:
                 self._release(neg_key)
-            if pos_key not in self._pressed_keys:
+            if pos_key in self._pressed_keys:
                 self._release(pos_key)
             return
 
