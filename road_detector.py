@@ -349,6 +349,15 @@ class OverlayWindow:
                 time.sleep(0.05)
                 continue
 
+            # Asegurar que las mascaras coincidan con el frame actual
+            # (puede haber diferencia de 1px por redondeo entre frames)
+            if da_mask.shape[:2] != (h, w):
+                da_mask = cv2.resize(da_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
+                da_mask = (da_mask > 0.5).astype(np.uint8)
+            if ll_mask is not None and ll_mask.shape[:2] != (h, w):
+                ll_mask = cv2.resize(ll_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
+                ll_mask = (ll_mask > 0.5).astype(np.uint8)
+
             # ---- CONSTRUIR VISUALIZACION ----
             if self._display_mode == "mask":
                 result = np.zeros((h, w, 3), dtype=np.uint8)
