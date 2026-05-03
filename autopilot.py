@@ -122,12 +122,25 @@ class ObstacleAssessor:
 
         max_brake = 0.0
         closest = 0.0
+        img_area = img_h * img_w
 
         for det in detections:
             x1, y1, x2, y2, label, score = det
             if label not in self.DANGEROUS:
                 continue
             if score < 0.35:
+                continue
+
+            area = (x2 - x1) * (y2 - y1)
+            area_ratio = area / (img_area + 1e-6)
+
+            # Filter 1: own vehicle / trailer (huge box at bottom)
+            if area_ratio > 0.20:
+                # Object covers >20% of screen = almost certainly our own truck
+                continue
+
+            # Filter 2: object starts very low (y1 > 70%) = hood/dashboard reflection
+            if y1 > img_h * 0.72 and area_ratio > 0.05:
                 continue
 
             dist_ratio = y2 / img_h
@@ -138,10 +151,10 @@ class ObstacleAssessor:
             if not in_lane and dist_ratio < 0.70:
                 continue
 
-            # Stronger risk curve: brake hard when object is in lower 60% of frame
+            # Risk curve: only brake for objects in lower 55% of frame
             risk = 0.0
-            if dist_ratio > 0.50:
-                risk = ((dist_ratio - 0.50) / 0.50) ** 1.8
+            if dist_ratio > 0.55:
+                risk = ((dist_ratio - 0.55) / 0.45) ** 2.0
             if label == "person":
                 risk = min(1.0, risk * 1.5)
 
@@ -380,7 +393,7 @@ class Autopilot:
             steer = 0.0
         elif self.state == "EMERGENCY":
             throttle = -1.0
-        elif obstacle_brake > 0.85 or closest_obstacle > 0.90:
+        elif obstacle_brake > 0.90 or closest_obstacle > 0.96:
             # Immediate hard brake, bypass gentle slowdown
             throttle = -1.0
         elif closest_obstacle > 0.65 and speed_error > 0:
