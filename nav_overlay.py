@@ -52,15 +52,22 @@ GPS_SCALE = 0.5
 SHOW_MIRRORS = True
 
 # Colores HSV para deteccion en el GPS (OpenCV HSV)
-# Ajustados a los colores reales de ETS2 (iluminacion variable)
+# ESTRATEGIA: detectar TODO lo brillante contra fondo negro, luego clasificar por hue.
+# El GPS de ETS2 tiene fondo NEGRO con patron de malla. Los elementos brillantes
+# destacan por alto V y S. Los grises de las carreteras tienen S baja.
 HSV_RANGES = {
-    # Azul cian brillante (flecha posicion)
-    "blue":   ([90,  125, 120, 255, 100, 255], (255, 255,   0)),
-    # Rojo anaranjado oscuro/marrón (ruta GPS en ETS2)
-    "red":    ([0,   25,  80, 255,  60, 255], (0,   255, 255)),
-    "red2":   ([160, 180,  80, 255,  60, 255], (0,   255, 255)),
-    # Verde lima brillante (flechas direccion)
-    "green":  ([35,   90,  80, 255,  80, 255], (0,   255,   0)),
+    # Azul cielo (flecha posicion del jugador)
+    # H: 85-125 cubre azul cielo a azul cyan
+    "blue":   ([85,  125,  50, 255,  60, 255], (255, 255,   0)),
+    # Rojo/naranja/marron (ruta a seguir)
+    # H: 0-25 y 155-180 cubre rojo, naranja, marron rojizo
+    "red":    ([0,    30,  40, 255,  40, 255], (0,   255, 255)),
+    "red2":   ([150, 180,  40, 255,  40, 255], (0,   255, 255)),
+    # Verde lima/verde claro (flechas de direccion del giro)
+    # H: 30-80 cubre verde lima a verde esmeralda
+    "green":  ([30,   80,  40, 255,  50, 255], (0,   255,   0)),
+    # Amarillo/naranja (centro de la flecha azul, lineas amarillas)
+    "yellow": ([15,   35,  60, 255,  80, 255], (0,   255, 255)),
 }
 
 
@@ -79,88 +86,101 @@ def get_region_frame(frame, region_spec):
 
 def process_gps(frame_bgr):
     """
-    Detecta y resalta elementos del panel GPS:
-      - Flecha azul  (posicion)
-      - Linea roja/naranja   (ruta)
-      - Flechas verdes (direccion)
-      - Texto blanco (velocidad, km, tiempo)
-    Retorna frame procesado + dict con info detectada.
+    Detecta elementos del GPS por contraste contra fondo negro.
+    Estrategia: el fondo es oscuro (V<40). Todo lo con V>40 y S>30 es un elemento.
+    Luego clasificar por hue en rangos amplios.
     """
     if frame_bgr is None or frame_bgr.size == 0:
         return frame_bgr, {}
 
     result = frame_bgr.copy()
     h, w = result.shape[:2]
-    info = {"blue": 0, "red": 0, "green": 0, "text": 0}
+    info = {"blue": 0, "red": 0, "green": 0, "yellow": 0, "text": 0}
 
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    # Paso 1: excluir fondo oscuro y grises de carretera
+    # Fondo del GPS: V<30, patrón negro
+    # Carreteras grises: S<30
+    # Elementos brillantes: V>40 y S>25
+    v_channel = hsv[:, :, 2]
+    s_channel = hsv[:, :, 1]
+    mask_bright = (v_channel > 40) & (s_channel > 25)
+    mask_bright = mask_bright.astype(np.uint8) * 255
+
+    # Paso 2: clasificar brillantes por hue
+    h_channel = hsv[:, :, 0].astype(np.int16)
+
+    # Azul: H 80-130
+    mask_blue = mask_bright.copy()
+    mask_blue[(h_channel < 80) | (h_channel > 130)] = 0
+    # Rojo/naranja: H 0-30 o 150-180
+    mask_red = mask_bright.copy()
+    mask_red[((h_channel > 30) & (h_channel < 150))] = 0
+    # Verde: H 25-85
+    mask_green = mask_bright.copy()
+    mask_green[(h_channel < 25) | (h_channel > 85)] = 0
+    # Amarillo: H 10-35
+    mask_yellow = mask_bright.copy()
+    mask_yellow[(h_channel < 10) | (h_channel > 35)] = 0
+
     kernel = np.ones((3, 3), np.uint8)
+    kernel_close = np.ones((5, 5), np.uint8)
 
     # --- Azul (flecha posicion) ---
-    lower = np.array(HSV_RANGES["blue"][0][:3])
-    upper = np.array(HSV_RANGES["blue"][0][3:])
-    mask_blue = cv2.inRange(hsv, lower, upper)
     mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if 30 < area < 8000:
+        if 25 < area < 10000:
             x, y, bw, bh = cv2.boundingRect(cnt)
-            aspect = bw / max(bh, 1)
-            if 0.3 < aspect < 3.0:
-                cv2.rectangle(result, (x, y), (x + bw, y + bh), (255, 255, 0), 2)
-                cv2.putText(result, "POS", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-                info["blue"] += 1
+            cv2.rectangle(result, (x, y), (x + bw, y + bh), (255, 255, 0), 2)
+            cv2.putText(result, "POS", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            info["blue"] += 1
 
     # --- Rojo/naranja (ruta) ---
-    lower1 = np.array(HSV_RANGES["red"][0][:3])
-    upper1 = np.array(HSV_RANGES["red"][0][3:])
-    lower2 = np.array(HSV_RANGES["red2"][0][:3])
-    upper2 = np.array(HSV_RANGES["red2"][0][3:])
-    mask_red = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
-    # Cerrar para unir fragmentos de ruta
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel_close)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > 40:  # Mas permisivo para capturar la ruta
+        if area > 25:
             x, y, bw, bh = cv2.boundingRect(cnt)
-            # La ruta es larga y angosta, O grande
-            aspect = max(bw, bh) / max(min(bw, bh), 1)
-            if aspect > 1.2 or area > 200:
-                cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 255, 255), 2)
-                info["red"] += 1
+            cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 255, 255), 2)
+            info["red"] += 1
 
     # --- Verde (flechas direccion) ---
-    lower = np.array(HSV_RANGES["green"][0][:3])
-    upper = np.array(HSV_RANGES["green"][0][3:])
-    mask_green = cv2.inRange(hsv, lower, upper)
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if 10 < area < 3000:  # Mas permisivo
+        if 8 < area < 5000:
             x, y, bw, bh = cv2.boundingRect(cnt)
             cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             cv2.putText(result, "DIR", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             info["green"] += 1
 
-    # --- Texto blanco (velocidad, km, tiempo) ---
-    # Texto claro sobre fondo oscuro: alto V, baja S
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    # Blanco/gris claro (texto)
-    _, mask_white = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    # Eliminar ruido
-    mask_white = cv2.morphologyEx(mask_white, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    contours, _ = cv2.findContours(mask_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # --- Amarillo (centro flecha, lineas amarillas) ---
+    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if 15 < area < 5000:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 255, 255), 1)
+            info["yellow"] += 1
+
+    # --- Texto blanco (alto V, muy baja S) ---
+    mask_text = (v_channel > 160) & (s_channel < 40)
+    mask_text = mask_text.astype(np.uint8) * 255
+    mask_text = cv2.morphologyEx(mask_text, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    contours, _ = cv2.findContours(mask_text, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     text_boxes = []
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if 15 < bw < 200 and 8 < bh < 40:
+        if 10 < bw < 250 and 6 < bh < 50 and y < h * 0.35:
             text_boxes.append((x, y, bw, bh))
     if text_boxes:
-        # Dibujar un solo rectangulo alrededor de todo el bloque de texto
         xs = [b[0] for b in text_boxes]
         ys = [b[1] for b in text_boxes]
         x2s = [b[0] + b[2] for b in text_boxes]
@@ -330,8 +350,9 @@ class NavOverlayManager:
         b = gps_info.get("blue", 0)
         r = gps_info.get("red", 0)
         g = gps_info.get("green", 0)
+        y = gps_info.get("yellow", 0)
         t = gps_info.get("text", 0)
-        info_text = f"Nav FPS:{fps} | pos:{b} ruta:{r} dir:{g} info:{t}"
+        info_text = f"Nav FPS:{fps} | pos:{b} ruta:{r} dir:{g} y:{y} info:{t}"
         self.lbl_info.configure(text=info_text)
 
         # Geometria
