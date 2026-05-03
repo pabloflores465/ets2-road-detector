@@ -482,13 +482,10 @@ class MainWindow:
                     except Exception:
                         pass
                 ap_dets = self._normalize_dets(objs)
-                # Build ll_mask for autopilot
-                ll_mask_for_ap = ll_mask if ll_mask is not None else np.zeros((h, w), dtype=np.uint8)
-
                 ap_status = self.autopilot.update(
                     frame_bgr,
                     da_seg_out if da_seg_out is not None else np.zeros((1, 2, MODEL_RES, MODEL_RES), dtype=np.float32),
-                    ll_mask_for_ap,
+                    ll_seg_out if ll_seg_out is not None else np.zeros((1, 2, MODEL_RES, MODEL_RES), dtype=np.float32),
                     ap_dets, gps_crop, gps_info
                 )
 
@@ -496,30 +493,16 @@ class MainWindow:
                 ap_state = ap_status.get("state", "?")
                 ap_steer = ap_status.get("steering", 0)
                 ap_thr = ap_status.get("throttle", 0)
-                lx = ap_status.get("left_x")
-                rx = ap_status.get("right_x")
+                lc = ap_status.get("lane_center")
                 hud = f"AP {ap_state} S:{ap_steer:+.2f} T:{ap_thr:.2f}"
                 cv2.putText(result, hud, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
-                # Visual lane contour guide
-                y_road_top = int(h * 0.30)
-                y_road_bot = int(h * 0.75)
-                # Draw road region box
-                cv2.rectangle(result, (0, y_road_top), (w, y_road_bot), (255, 255, 0), 1)
-                # Draw lane boundary markers
-                if lx is not None:
-                    cv2.line(result, (lx, y_road_top), (lx, y_road_bot), (0, 0, 255), 3)
-                    cv2.putText(result, f"L", (lx - 10, y_road_bot + 15),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                if rx is not None:
-                    cv2.line(result, (rx, y_road_top), (rx, y_road_bot), (0, 0, 255), 3)
-                    cv2.putText(result, f"R", (rx + 5, y_road_bot + 15),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                # Draw target center
-                if lx is not None and rx is not None:
-                    target_cx = (lx + rx) // 2
-                    cv2.line(result, (target_cx, y_road_top), (target_cx, y_road_bot), (0, 255, 0), 2)
-                    cv2.circle(result, (target_cx, (y_road_top + y_road_bot) // 2), 8, (0, 255, 0), 2)
+                # Visual lane center guide (original style)
+                if lc is not None:
+                    cv2.circle(result, (int(lc), h - 20), 8, (0, 255, 0), 2)
+                    cv2.line(result, (w // 2, h - 20), (int(lc), h - 20), (0, 255, 0), 2)
+                # Target center line
+                cv2.line(result, (w // 2, h - 40), (w // 2, h), (255, 0, 0), 2)
 
                 # Log frame + autopilot state for review
                 if self.nav_win and self.nav_win.last_gps_crop is not None:
