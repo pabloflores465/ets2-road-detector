@@ -13,6 +13,14 @@ import threading
 from pynput.keyboard import Controller, Key
 
 
+_KEY_NAMES = {
+    Key.up: "UP",
+    Key.down: "DOWN",
+    Key.left: "LEFT",
+    Key.right: "RIGHT",
+}
+
+
 class VehicleController:
     """
     Smooth vehicle control via PWM on digital keys.
@@ -39,9 +47,11 @@ class VehicleController:
         self._last_cmd_time = time.time()
         self._cycle_counter = 0
         self._pressed_keys = set()
+        self._log_counter = 0
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        print(f"[VC] VehicleController started at {hz} Hz")
 
     def set_controls(self, steering: float, throttle: float):
         """Update desired steering [-1,1] and throttle [-1,1]."""
@@ -50,13 +60,20 @@ class VehicleController:
             self.throttle = max(-1.0, min(1.0, float(throttle)))
             self._last_cmd_time = time.time()
 
+    @property
+    def active_keys(self):
+        """Return list of currently pressed key names."""
+        return [_KEY_NAMES.get(k, str(k)) for k in self._pressed_keys]
+
     def _loop(self):
         while self._running:
             t0 = time.time()
 
             # Watchdog: if no commands for > 0.6 s, emergency release
             if time.time() - self._last_cmd_time > 0.6:
-                self._release_all()
+                if self._pressed_keys:
+                    print("[VC] WATCHDOG: no commands, releasing all keys")
+                    self._release_all()
                 time.sleep(self.period)
                 continue
 
@@ -65,15 +82,22 @@ class VehicleController:
                 s = self.steering
                 t = self.throttle
 
-            self._apply_axis(s, Key.left, Key.right)
-            self._apply_axis(t, Key.down, Key.up)
+            self._apply_axis("STEER", s, Key.left, Key.right)
+            self._apply_axis("THROT", t, Key.down, Key.up)
+
+            # Log every ~1 second (30 cycles)
+            self._log_counter += 1
+            if self._log_counter >= 30:
+                self._log_counter = 0
+                keys = ",".join(self.active_keys) if self.active_keys else "none"
+                print(f"[VC] steer={s:+.2f} thr={t:+.2f} keys=[{keys}]")
 
             elapsed = time.time() - t0
             sleep = self.period - elapsed
             if sleep > 0:
                 time.sleep(sleep)
 
-    def _apply_axis(self, value, neg_key, pos_key):
+    def _apply_axis(self, name, value, neg_key, pos_key):
         """PWM key control for a single axis."""
         dead = 0.05
         abs_val = abs(value)
@@ -105,16 +129,18 @@ class VehicleController:
             try:
                 self.kb.press(key)
                 self._pressed_keys.add(key)
-            except Exception:
-                pass
+                print(f"[VC] PRESS  {_KEY_NAMES.get(key, str(key))}")
+            except Exception as e:
+                print(f"[VC] ERROR pressing {key}: {e}")
 
     def _release(self, key):
         if key in self._pressed_keys:
             try:
                 self.kb.release(key)
                 self._pressed_keys.discard(key)
-            except Exception:
-                pass
+                print(f"[VC] RELEASE {_KEY_NAMES.get(key, str(key))}")
+            except Exception as e:
+                print(f"[VC] ERROR releasing {key}: {e}")
 
     def _release_all(self):
         for key in list(self._pressed_keys):
@@ -122,6 +148,7 @@ class VehicleController:
 
     def emergency_stop(self):
         """Hard brake, release steering."""
+        print("[VC] EMERGENCY STOP")
         with self._lock:
             self.steering = 0.0
             self.throttle = -1.0
@@ -130,7 +157,9 @@ class VehicleController:
 
     def stop(self):
         """Shutdown controller, release all keys."""
+        print("[VC] Stopping controller...")
         self._running = False
         self._release_all()
         if self._thread.is_alive():
             self._thread.join(timeout=0.5)
+        print("[VC] Controller stopped")

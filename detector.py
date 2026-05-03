@@ -22,6 +22,7 @@ from PIL import Image, ImageTk
 from ets2_capture import find_ets2_window, capture_window_quartz, capture_fallback, select_region_manual
 from nav_overlay import NavOverlayManager
 from autopilot import Autopilot
+from pynput import keyboard as pynput_kb
 
 # -----------------------------------------------------------------------------
 # CONFIGURACION
@@ -328,6 +329,14 @@ class MainWindow:
     def set_nav_overlay(self, nav_win):
         self.nav_win = nav_win
 
+    def _on_hotkey(self, key):
+        try:
+            if key == pynput_kb.Key.f9:
+                print("[HOTKEY] F9 pressed — toggling autopilot")
+                self._toggle_ap()
+        except Exception as e:
+            print(f"[HOTKEY] error: {e}")
+
     def _toggle_ap(self):
         enabled = self.autopilot.toggle()
         self.btn_ap.configure(text=f"AP:{'ON' if enabled else 'OFF'}",
@@ -544,7 +553,14 @@ class MainWindow:
             if self.autopilot.enabled and self.autopilot.status:
                 s = self.autopilot.status
                 ap_text = f" | AP:{s.get('state','?')} S:{s.get('steering',0):+.2f}"
-            info_text = f"FPS:{fps} | {backend} | objs:{obj_count}{ap_text}"
+            # Mostrar teclas activas del autopilot
+            ap_keys = ""
+            if self.autopilot.enabled and self.autopilot.status:
+                keys = self.autopilot.status.get("keys", [])
+                if keys:
+                    ap_keys = " | " + ",".join(keys)
+
+            info_text = f"FPS:{fps} | {backend} | objs:{obj_count}{ap_text}{ap_keys}"
             self.lbl_info.configure(text=info_text)
             self.lbl_info.place(x=0, y=new_h, width=new_w, height=18)
             self.root.geometry(f"{new_w}x{new_h + 18}")
@@ -618,11 +634,17 @@ def main():
     nav_win = NavOverlayManager(nav_root, win_info)
     main_win.set_nav_overlay(nav_win)
 
+    # Hotkey listener (F9 = toggle autopilot)
+    print("[INFO] Press F9 to toggle autopilot")
+    hotkey_listener = pynput_kb.Listener(on_press=main_win._on_hotkey)
+    hotkey_listener.start()
+
     try:
         root.mainloop()
     except KeyboardInterrupt:
         pass
     finally:
+        hotkey_listener.stop()
         main_win.autopilot.shutdown()
 
     print("[INFO] Cerrado.")

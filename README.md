@@ -54,19 +54,73 @@ Esto hace todo automaticamente:
 1. Abre **Euro Truck Simulator 2**.
 2. Ejecuta `./run.sh`.
 3. El script detecta automaticamente la ventana del juego.
-4. Aparece ventana **flotante sin bordes** siempre encima.
-5. **Arrastra** para moverla donde quieras.
+4. Aparecen **dos ventanas flotantes** siempre encima:
+   - Principal: deteccion de carretera + objetos + controles del autopilot
+   - Secundaria: panel GPS + retrovisores
+5. **Arrastra** para moverlas donde quieras.
 6. Presiona **X** rojo para cerrar.
+
+## Autopilot (Conduccion Autonoma)
+
+El detector incluye un **piloto automatico** que conduce el camion usando las flechas del teclado.
+
+### Como activar
+
+- **F9** — Activa/desactiva el autopilot (desde cualquier ventana)
+- O haz clic en el boton **AP:OFF** (naranja) → cambia a **AP:ON** (verde)
+
+### Que hace
+
+- **Mantiene el carril** usando las lineas blancas detectadas por YOLOP
+- **Sigue la ruta GPS** usando el minimapa (linea roja/naranja)
+- **Frena ante obstaculos** detectados por el Coral TPU
+- **Reduce velocidad en curvas** automaticamente
+- Usa **micro-toques PWM** en las flechas para simular control analogico suave
+
+### Permiso CRITICO: Accesibilidad
+
+`pynput` necesita permisos para enviar teclas al sistema. **Esto es lo mas comun que falla.**
+
+1. **Preferencias del Sistema > Privacidad y Seguridad > Accesibilidad**
+2. Añade **TODAS** estas aplicaciones (usa el boton `+` y busca en `/Users/pabloflores/Documents/robotics/ets2_road_detector/.venv/bin/python`):
+   - Tu terminal (**Terminal.app**, **iTerm2**)
+   - **Python** (la ruta exacta del venv: `.venv/bin/python`)
+3. **Reinicia la terminal**
+
+#### Verificar que funciona
+
+```bash
+uv run python3 test_controls.py
+```
+
+Deberias ver letras aparecer en TextEdit/Notes. Si no aparece nada, **el permiso no esta bien configurado**.
+
+#### Si sigue sin funcionar
+
+En macOS Sequoia/Tahoe, a veces hay que dar permiso a la **aplicacion padre** que lanza el script. Prueba añadir tambien:
+- `bash`
+- `zsh`
+- `Code` (si usas VS Code terminal)
+
+Tambien puedes ejecutar desde Terminal.app directamente (no desde VS Code) para aislar el problema.
 
 ## Permisos en macOS (obligatorio)
 
-### Grabacion de pantalla
+### 1. Grabacion de pantalla
 
 1. **Preferencias del Sistema > Privacidad y Seguridad > Grabacion de pantalla**
 2. Activa tu terminal (**Terminal**, **iTerm2**, **VS Code**)
 3. **Reinicia la terminal**
 
 Sin esto la ventana sale negra.
+
+### 2. Accesibilidad (solo si usas autopilot)
+
+1. **Preferencias del Sistema > Privacidad y Seguridad > Accesibilidad**
+2. Añade tu terminal **y** el ejecutable de Python del venv (`.venv/bin/python`)
+3. **Reinicia la terminal**
+
+Sin esto el autopilot no puede enviar teclas al juego.
 
 ## Coral TPU
 
@@ -123,12 +177,18 @@ Edita constantes al inicio de `detector.py`:
 | FPS muy bajos | Baja `MODEL_RES` a 320, sube `FRAME_SKIP`, baja `CAPTURE_MAX_H` |
 | `macOS 26 required, have 16` | Python 3.9 del sistema tiene tkinter roto. `run.sh` usa `uv` con Python 3.9.25 que funciona. |
 | CPU al 90% | Normal. CoreML ayuda. Coral TPU reduce carga masivamente. |
+| Autopilot no hace nada | **Permiso de Accesibilidad** no configurado. Corre `test_controls.py` para verificar. |
+| Autopilot gira a lo loco | Ajusta `kp_steer` en `autopilot.py` (baja si oscila, sube si no corrige) |
+| Autopilot acelera muy rapido | Baja `target_speed` o `kp_speed` en `autopilot.py` |
 
 ## Comandos utiles
 
 ```bash
 # Correr detector (todo automatico)
 ./run.sh
+
+# Verificar permisos de teclado (pynput)
+uv run python3 test_controls.py
 
 # Verificar Coral TPU
 export DYLD_LIBRARY_PATH="/usr/local/lib:${DYLD_LIBRARY_PATH}"
@@ -138,7 +198,7 @@ uv run python3 -c "from pycoral.utils.edgetpu import list_edge_tpus; print(list_
 uv run python3 -c "import onnxruntime as ort; print(ort.get_available_providers())"
 
 # Instalar dependencias manualmente
-uv pip install onnxruntime opencv-python "numpy<2" Pillow mss pyobjc-framework-Quartz
+uv pip install onnxruntime opencv-python "numpy<2" Pillow mss pyobjc-framework-Quartz pynput
 uv pip install https://github.com/google-coral/pycoral/releases/download/v2.0.0/tflite_runtime-2.5.0.post1-cp39-cp39-macosx_12_0_arm64.whl
 uv pip install https://github.com/google-coral/pycoral/releases/download/v2.0.0/pycoral-2.0.0-cp39-cp39-macosx_12_0_arm64.whl
 
@@ -153,8 +213,12 @@ uv venv --python 3.9 .venv
 ```
 ets2_road_detector/
 ├── run.sh                   # Comando principal: ./run.sh
-├── detector.py              # Detector unificado YOLOP + Coral
+├── detector.py              # Detector unificado YOLOP + Coral + Autopilot UI
+├── autopilot.py             # Logica de conduccion autonoma
+├── vehicle_control.py       # Control PWM de flechas de teclado
+├── nav_overlay.py           # Ventana GPS + retrovisores
 ├── ets2_capture.py          # Captura de ventana via Quartz
+├── test_controls.py         # Test de permisos pynput
 ├── road_detector.py         # YOLOP puro (legacy)
 ├── coral_detector.py        # Coral puro (legacy)
 ├── coral_setup.sh           # Script de setup manual para Coral

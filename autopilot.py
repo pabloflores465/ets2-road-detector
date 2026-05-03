@@ -42,6 +42,7 @@ class LaneAnalyzer:
             lane_width_px (estimated)
         """
         if ll_seg is None or ll_seg.size == 0:
+            print("[LANE] ll_seg is None/empty")
             return self.prev_center, self.prev_heading, None
 
         # ll_seg[0,1] = lane-line probability map
@@ -49,6 +50,8 @@ class LaneAnalyzer:
         h, w = prob.shape
         scale_x = img_width / w
         scale_y = img_height / h
+
+        print(f"[LANE] ll_seg shape={ll_seg.shape}, prob map shape={prob.shape}, max_prob={float(np.max(prob)):.3f}")
 
         # Sample rows in bottom half (closer to truck)
         y_ratios = [0.55, 0.65, 0.75, 0.85, 0.92]
@@ -87,6 +90,7 @@ class LaneAnalyzer:
                 left_xs.append(lx * scale_x)
 
         if not centers:
+            print(f"[LANE] No lane centers found (checked {len(y_ratios)} rows)")
             return self.prev_center, self.prev_heading, None
 
         lane_center = float(np.median(centers))
@@ -106,6 +110,7 @@ class LaneAnalyzer:
 
         self.prev_center = lane_center
         self.prev_heading = heading
+        print(f"[LANE] center={lane_center:.1f} heading={heading:.3f} width={lane_width}")
         return lane_center, heading, lane_width
 
 
@@ -156,6 +161,8 @@ class ObstacleAssessor:
             max_brake = max(max_brake, risk)
             closest = max(closest, dist_ratio)
 
+        if max_brake > 0.01:
+            print(f"[OBS] brake={max_brake:.3f} closest={closest:.3f} dets={len(detections)}")
         return max_brake, closest
 
 
@@ -189,6 +196,7 @@ class GPSNavigator:
 
         ys, xs = np.where(mask > 0)
         if len(xs) < 15:
+            print(f"[GPS] No route pixels found ({len(xs)} red pixels)")
             return self.prev_bias, None
 
         # Route centroid vs player position (roughly center of minimap)
@@ -202,18 +210,9 @@ class GPSNavigator:
         # Dampen bias so GPS is a gentle nudge, not a sharp command
         bias *= 0.35
         self.prev_bias = bias
+        print(f"[GPS] route_cx={route_cx:.1f} player_cx={player_cx:.1f} bias={bias:.3f} pixels={len(xs)}")
 
-        # Speed hint from white text in top of minimap (very crude)
-        gray = cv2.cvtColor(gps_crop, cv2.COLOR_BGR2GRAY)
-        top_region = gray[: int(h * 0.25), :]
-        bright = np.sum(top_region > 180)
-        speed_hint = None
-        if bright > 200:
-            # Heuristic: lots of white text = probably showing speed limit or distance
-            # We don't OCR yet, so we leave None and let default target speed rule.
-            pass
-
-        return bias, speed_hint
+        return bias, None
 
 
 # ───────────────────────────────
@@ -285,12 +284,14 @@ class Autopilot:
     def toggle(self):
         self.enabled = not self.enabled
         if not self.enabled:
+            print("[AP] DISABLED — releasing controls")
             self.vc.set_controls(0.0, 0.0)
             self.vc._release_all()
             self.state = "IDLE"
             self.steer_limiter.value = 0.0
             self.throttle_limiter.value = 0.0
         else:
+            print("[AP] ENABLED — autonomous driving active")
             self.state = "ACTIVE"
         return self.enabled
 
@@ -317,6 +318,7 @@ class Autopilot:
         h, w = raw_bgr.shape[:2]
 
         # ── 1. Perception Fusion ──
+        print(f"\n[AP] ===== frame {self._frame_counter} | {w}x{h} =====")
         lane_center, lane_heading, lane_width = self.lane_analyzer.analyze(
             ll_seg, w, h
         )
@@ -406,6 +408,8 @@ class Autopilot:
         smooth_steer = self.steer_limiter.update(steer)
         smooth_throttle = self.throttle_limiter.update(throttle)
 
+        print(f"[AP] state={self.state} | raw S={steer:+.2f} T={throttle:+.2f} | smooth S={smooth_steer:+.2f} T={smooth_throttle:+.2f} | Vtgt={target:.1f} Vcur={current_speed:.1f}")
+
         self.vc.set_controls(smooth_steer, smooth_throttle)
 
         self._status_info = {
@@ -418,15 +422,18 @@ class Autopilot:
             "lane_heading": round(lane_heading, 2),
             "obstacle_brake": round(obstacle_brake, 2),
             "gps_bias": round(gps_steer_bias, 2) if gps_steer_bias is not None else None,
+            "keys": self.vc.active_keys,
         }
         return self._status_info
 
     def emergency_stop(self):
         """External call for immediate full stop."""
+        print("[AP] EMERGENCY STOP called")
         self.state = "EMERGENCY"
         self.vc.emergency_stop()
 
     def shutdown(self):
+        print("[AP] Shutdown")
         self.enabled = False
         self.vc.stop()
 
@@ -437,11 +444,7 @@ class Autopilot:
         For now we assume the truck roughly tracks target speed with lag.
         """
         # Very crude: if we see GPS text, maybe we can guess
-        # Otherwise return a conservative estimate
-        if gps_info and gps_info.get("text", 0) > 0:
-            # Some text visible; can't read it yet without OCR
-            pass
-        # Return default target as proxy (control loop will handle error)
+        # Otherwise return default target as proxy (control loop will handle error)
         return self.target_speed * 0.6
 
     @property
