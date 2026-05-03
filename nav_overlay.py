@@ -31,8 +31,9 @@ FPS_LIMIT = 30
 # Regiones como fracciones del frame (0.0 - 1.0)
 REGIONS = {
     "gps": {
-        "left": 0.60, "top": 0.58,
-        "width": 0.39, "height": 0.40,
+        # Solo el panel de mapa (derecha), SIN el panel de controles (izquierda)
+        "left": 0.55, "top": 0.56,
+        "width": 0.44, "height": 0.43,
     },
     "mirror_left": {
         "left": 0.02, "top": 0.06,
@@ -51,12 +52,15 @@ GPS_SCALE = 0.5
 SHOW_MIRRORS = True
 
 # Colores HSV para deteccion en el GPS (OpenCV HSV)
-# [H_min, H_max, S_min, S_max, V_min, V_max]
+# Ajustados a los colores reales de ETS2
 HSV_RANGES = {
-    "blue":   ([100, 140,  80, 255, 100, 255], (255, 0,   0)),   # flecha azul
-    "red":    ([0,   10,   80, 255, 100, 255], (0,   0, 255)),   # ruta roja
-    "red2":   ([170, 180,  80, 255, 100, 255], (0,   0, 255)),   # ruta roja (envuelve)
-    "green":  ([35,  85,  80, 255, 100, 255], (0, 255,   0)),   # flechas direccion
+    # Azul cian brillante (flecha posicion) — muy saturado, brillo alto
+    "blue":   ([95,  115, 150, 255, 150, 255], (255, 255,   0)),
+    # Rojo anaranjado brillante (ruta) — saturacion alta
+    "red":    ([0,    15, 120, 255, 120, 255], (0,   255, 255)),
+    "red2":   ([165, 180, 120, 255, 120, 255], (0,   255, 255)),
+    # Verde lima brillante (flechas direccion)
+    "green":  ([40,   75, 120, 255, 120, 255], (0,   255,   0)),
 }
 
 
@@ -79,7 +83,6 @@ def process_gps(frame_bgr):
       - Flecha azul  (posicion)
       - Linea roja   (ruta)
       - Flechas verdes (direccion)
-      - Area de texto (kilometraje)
     Retorna frame procesado + dict con info detectada.
     """
     if frame_bgr is None or frame_bgr.size == 0:
@@ -91,67 +94,56 @@ def process_gps(frame_bgr):
 
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-    # --- Azul (flecha posicion) ---
+    # --- Azul (flecha posicion — triangulo azul cian) ---
     lower = np.array(HSV_RANGES["blue"][0][:3])
     upper = np.array(HSV_RANGES["blue"][0][3:])
     mask_blue = cv2.inRange(hsv, lower, upper)
+    # Operaciones morfologicas para eliminar ruido pequeno
+    kernel = np.ones((3, 3), np.uint8)
+    mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > 20:
+        if 50 < area < 5000:  # La flecha azul es un area mediana
             x, y, bw, bh = cv2.boundingRect(cnt)
-            cv2.rectangle(result, (x, y), (x + bw, y + bh), (255, 0, 0), 2)
-            cv2.putText(result, "POS", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-            info["blue"] += 1
+            # La flecha es triangular (aspect ratio ~1.0)
+            aspect = bw / max(bh, 1)
+            if 0.5 < aspect < 2.0:
+                cv2.rectangle(result, (x, y), (x + bw, y + bh), (255, 255, 0), 2)
+                cv2.putText(result, "POS", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                info["blue"] += 1
 
-    # --- Rojo (ruta) ---
+    # --- Rojo (ruta — linea ancha y larga) ---
     lower1 = np.array(HSV_RANGES["red"][0][:3])
     upper1 = np.array(HSV_RANGES["red"][0][3:])
     lower2 = np.array(HSV_RANGES["red2"][0][:3])
     upper2 = np.array(HSV_RANGES["red2"][0][3:])
     mask_red = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > 30:
+        if area > 80:  # La ruta es un area grande
             x, y, bw, bh = cv2.boundingRect(cnt)
-            cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 0, 255), 2)
-            info["red"] += 1
+            # La ruta es larga y relativamente delgada
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            if aspect > 1.5 or area > 500:
+                cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 255, 255), 2)
+                info["red"] += 1
 
-    # --- Verde (flechas direccion) ---
+    # --- Verde (flechas direccion — pequenas triangulares) ---
     lower = np.array(HSV_RANGES["green"][0][:3])
     upper = np.array(HSV_RANGES["green"][0][3:])
     mask_green = cv2.inRange(hsv, lower, upper)
+    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > 20:
+        if 20 < area < 1500:  # Flechas pequenas
             x, y, bw, bh = cv2.boundingRect(cnt)
             cv2.rectangle(result, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-            cv2.putText(result, "DIR", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.putText(result, "DIR", (x, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             info["green"] += 1
-
-    # --- Texto / Info panel (area blanca en la parte superior del GPS) ---
-    # Detectar regiones con alto brillo (texto blanco)
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    _, mask_text = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-    # Erosion para eliminar ruido
-    kernel = np.ones((3, 3), np.uint8)
-    mask_text = cv2.erode(mask_text, kernel, iterations=1)
-    contours, _ = cv2.findContours(mask_text, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    text_boxes = []
-    for cnt in contours:
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        if bw > 30 and bh > 8 and y < h * 0.25:  # solo texto en la parte superior
-            text_boxes.append((x, y, bw, bh))
-    # Dibujar recuadro amarillo alrededor del bloque de texto
-    if text_boxes:
-        xs = [b[0] for b in text_boxes]
-        ys = [b[1] for b in text_boxes]
-        x2s = [b[0] + b[2] for b in text_boxes]
-        y2s = [b[1] + b[3] for b in text_boxes]
-        cv2.rectangle(result, (min(xs) - 2, min(ys) - 2), (max(x2s) + 2, max(y2s) + 2), (0, 255, 255), 2)
-        cv2.putText(result, "INFO", (min(xs), min(ys) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
     return result, info
 
