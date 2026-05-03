@@ -145,15 +145,15 @@ class ETSAutoLaneDetector:
     def preprocess(self, img):
         """img: BGR frame from ETS2"""
         h, w = img.shape[:2]
-        # ETSAuto crops top ~8% of height (sky). For variable input sizes,
-        # use proportional crop. Also account for macOS title bar (~22px).
-        crop_top = min(int(h * 0.08), 50)  # top 8% or max 50px
-        crop_bottom = min(int(h * 0.85), int(h * 0.85))  # bottom 15% is dashboard
-        img = img[crop_top:crop_bottom, :, :]
+        # ETSAuto does img[50:640, :, :] on ~640px tall images.
+        # They remove top 50px (sky) and KEEP the rest including dashboard.
+        # Proportional: remove top 8%, keep everything else.
+        crop_top = int(h * 50 / 640)  # proportional to ETSAuto's 50px crop
+        img = img[crop_top:, :, :]  # keep bottom (dashboard included!)
         img = cv2.resize(img, (self.input_shape[1], self.input_shape[0]))
-        # Convert BGR to RGB (model trained on RGB)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # Normalize (ImageNet) - Albumentations style
+        # Model trained with Albumentations on images loaded by OpenCV (BGR)
+        # Albumentations Normalize applies per-channel WITHOUT swapping.
+        # So we keep BGR and normalize directly.
         img = img.astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
