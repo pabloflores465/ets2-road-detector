@@ -529,24 +529,17 @@ def main():
 
     print("[INFO] Iniciando overlays (2 ventanas)...")
 
-    # Ventana 1: Deteccion de carretera + objetos
+    # Ambas ventanas se crean en el hilo PRINCIPAL (tkinter no es thread-safe)
     overlay = OverlayWindow(win_info, session, coral_interp, coral_labels, coral_detect)
-
-    # Ventana 2: GPS + retrovisores
     nav_overlay = NavOverlayWindow(win_info)
 
-    # Lanzar ambas ventanas en hilos separados
-    t1 = threading.Thread(target=overlay.run, daemon=True)
-    t2 = threading.Thread(target=nav_overlay.run, daemon=True)
-    t1.start()
-    t2.start()
-
+    # Solo un mainloop en el hilo principal; maneja ambas ventanas
     try:
-        while t1.is_alive() or t2.is_alive():
-            time.sleep(0.5)
+        nav_overlay.run()
     except KeyboardInterrupt:
         pass
 
+    overlay.on_close()
     print("[INFO] Cerrado.")
 
 
