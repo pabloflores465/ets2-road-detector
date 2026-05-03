@@ -2,11 +2,19 @@
 autopilot.py
 Autonomous driving stack for Euro Truck Simulator 2.
 
-Strategy based on stefanos50/YOLOP-Lane-Keeping-Assist:
-  - Two vertical raycasts from hood-level upward to find lane line hits
-  - Compare hit heights: if left line is closer (lower hit), steer right
-  - Constant throttle (always accelerate), only coast/brake for obstacles
-  - No speed PID — ETS2 keyboard steering barely works at very low speeds
+KEY INSIGHT from user screenshots:
+  - YOLOP lane lines are barely visible in ETS2 cabin view (dashboard blocks bottom)
+  - Raycasting from bottom hits the dashboard, not the road
+  - The reference implementation (stefanos50) used EXTERIOR camera view
+
+NEW STRATEGY (contour-based, no raycasting):
+  1. Take the ll_mask (binary lane line mask from YOLOP)
+  2. Find contours in the ROAD REGION only (ignore dashboard at bottom 25%)
+  3. Split into left/right groups by image center
+  4. Compute median X of each group -> lane boundaries
+  5. Steer to keep the CENTER between boundaries aligned with image center
+
+Fallback when no lanes: use GPS minimap heading.
 """
 import time
 import cv2
@@ -15,115 +23,106 @@ from vehicle_control import VehicleController
 
 
 # ───────────────────────────────
-# Lane Analyzer (raycast based)
+# Lane Analyzer (contour-based)
 # ───────────────────────────────
 class LaneAnalyzer:
     """
-    Instead of computing a global lane center, we cast two vertical rays
-    from near the bottom of the image upward into the ll_seg probability map.
-    The ray that hits its lane line lower (closer to the car) means the car
-    is closer to that side -> steer away.
+    Uses YOLOP ll_mask binary mask directly.
+    Finds lane line blobs, groups into left/right, computes center.
+    Ignores bottom 25% of image (dashboard/hood area).
     """
 
-    def __init__(self, ray_x_offset: float = 0.06):
-        # Horizontal offset from image center for each ray (as ratio of width)
-        # IMPORTANT: must be small enough that rays cross the RED lane lines,
-        # not the green drivable area. At 640x480, lane lines are ~60-80px
-        # from center. Offset 0.06 = ~38px at 640w.
-        self.ray_x_offset = ray_x_offset
-        self.prev_left_y = None
-        self.prev_right_y = None
-        self._steer_alpha = 0.65  # fast EMA for steering response
+    def __init__(self):
+        self._ema_center = None
+        self._ema_alpha = 0.50
 
-    def analyze(self, ll_seg, img_width: int, img_height: int):
+    def analyze(self, ll_mask, img_width: int, img_height: int):
         """
+        Args:
+            ll_mask: binary mask (H, W) uint8 from YOLOP postprocess
+                     1 = lane line pixel, 0 = background
         Returns:
-            steer_cmd: -1..1 (negative = steer left, positive = steer right)
-            left_y:  pixel Y where left ray hit lane line (or None)
-            right_y: pixel Y where right ray hit lane line (or None)
+            steer_cmd: -1..1
+            left_x: median X of left lane line pixels (or None)
+            right_x: median X of right lane line pixels (or None)
         """
-        if ll_seg is None or ll_seg.size == 0:
+        if ll_mask is None or ll_mask.size == 0:
             return 0.0, None, None
 
-        prob = ll_seg[0, 1, :, :]  # (H, W) float32 probabilities
-        h, w = prob.shape
+        h, w = ll_mask.shape[:2]
 
-        # Ray origin: near bottom of image
-        start_y = int(h * 0.92)
-        end_y = int(h * 0.30)  # look up to 30% from top
+        # Ignore bottom 25% (dashboard, hood, GPS panel)
+        # Keep only middle section: y from 30% to 75% of height
+        y_start = int(h * 0.30)
+        y_end = int(h * 0.75)
+        road_region = ll_mask[y_start:y_end, :]
 
-        # Ray X positions in model space
+        if np.sum(road_region) < 20:
+            # Almost no lane pixels in road region
+            return 0.0, None, None
+
+        # Find connected components (blobs)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            road_region.astype(np.uint8), connectivity=8
+        )
+
+        left_xs = []
+        right_xs = []
         mid_x = w // 2
-        left_x = int(mid_x - w * self.ray_x_offset)
-        right_x = int(mid_x + w * self.ray_x_offset)
-        left_x = max(2, min(w - 3, left_x))
-        right_x = max(2, min(w - 3, right_x))
 
-        # Cast upward from start_y to end_y
-        # Use 5-pixel wide rays for robustness + low threshold
-        left_hit = self._raycast_up_wide(prob, left_x, start_y, end_y)
-        right_hit = self._raycast_up_wide(prob, right_x, start_y, end_y)
+        for i in range(1, num_labels):  # skip background (0)
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < 15:  # ignore tiny noise
+                continue
 
-        # Convert to original image coords
-        scale_y = img_height / h
-        left_y = left_hit * scale_y if left_hit is not None else None
-        right_y = right_hit * scale_y if right_hit is not None else None
+            cx = int(centroids[i][0])
+            cy = int(centroids[i][1]) + y_start  # offset back to full image coords
 
-        if left_y is not None:
-            self.prev_left_y = left_y
-        if right_y is not None:
-            self.prev_right_y = right_y
+            # Classify as left or right line
+            if cx < mid_x - w * 0.08:
+                left_xs.append(cx)
+            elif cx > mid_x + w * 0.08:
+                right_xs.append(cx)
+            # Ignore blobs near center (could be hood reflections)
 
-        # ── Steering decision ──
+        left_x = int(np.median(left_xs)) if left_xs else None
+        right_x = int(np.median(right_xs)) if right_xs else None
+
+        # ── Steering ──
         steer = 0.0
 
-        if left_y is not None and right_y is not None:
-            # Both lines visible.
-            # If left_y > right_y, left line is closer to car (lower in image)
-            # -> car is closer to left line -> steer RIGHT
-            diff = left_y - right_y
-            # Very strong gain: 40 px diff -> full correction
-            raw_steer = np.clip(diff / 40.0, -1.0, 1.0)
-            # Boost small corrections so the truck doesn't drift
-            if abs(raw_steer) < 0.15:
-                raw_steer = np.sign(raw_steer) * 0.20
-            steer = raw_steer
+        if left_x is not None and right_x is not None:
+            lane_center = (left_x + right_x) / 2.0
+            image_center = w / 2.0
+            error = (lane_center - image_center) / (w / 2.0 + 1e-6)
 
-        elif left_y is not None and right_y is None:
-            # Only left line visible.
-            if left_y > img_height * 0.75:
-                steer = +0.80  # very close to left edge, steer right hard
-            elif left_y > img_height * 0.60:
-                steer = +0.50
+            # EMA smooth the error to reduce jitter
+            if self._ema_center is None:
+                self._ema_center = error
             else:
-                steer = -0.40  # only left visible far away, drift left
+                self._ema_center = self._ema_alpha * error + (1 - self._ema_alpha) * self._ema_center
 
-        elif right_y is not None and left_y is None:
-            if right_y > img_height * 0.75:
-                steer = -0.80
-            elif right_y > img_height * 0.60:
-                steer = -0.50
+            steer = float(np.clip(self._ema_center * 2.5, -1.0, 1.0))
+
+        elif left_x is not None and right_x is None:
+            # Only left line: steer right if too close
+            dist_from_center = (mid_x - left_x) / (w / 2.0)
+            if dist_from_center < 0.25:
+                steer = +0.60
             else:
-                steer = +0.40
+                steer = +0.20
+
+        elif right_x is not None and left_x is None:
+            dist_from_center = (right_x - mid_x) / (w / 2.0)
+            if dist_from_center < 0.25:
+                steer = -0.60
+            else:
+                steer = -0.20
 
         else:
-            # No lines at all.
             steer = 0.0
 
-        return steer, left_y, right_y
-
-    def _raycast_up_wide(self, prob, x, start_y, end_y):
-        """Return first Y (from bottom going up) where prob > threshold.
-        Samples a 5-pixel wide column with very low threshold."""
-        for y in range(start_y, end_y - 1, -1):
-            # Sample 5 pixels horizontally for robustness
-            vals = [
-                prob[y, x - 2], prob[y, x - 1], prob[y, x],
-                prob[y, x + 1], prob[y, x + 2]
-            ]
-            if max(vals) > 0.12:  # very low threshold to catch thin lane lines
-                return y
-        return None
+        return steer, left_x, right_x
 
 
 # ───────────────────────────────
@@ -143,7 +142,6 @@ class ObstacleAssessor:
             x1, y1, x2, y2, label, score = det
             if label not in self.DANGEROUS:
                 continue
-            # Stricter thresholds to avoid false positives
             if label in ("car", "truck", "bus") and score < 0.45:
                 continue
             if label == "person" and score < 0.55:
@@ -201,7 +199,7 @@ class GPSNavigator:
 
         route_cx = float(np.median(xs))
         bias = (route_cx - w * 0.5) / (w * 0.45)
-        bias = float(np.clip(bias, -1.0, 1.0)) * 0.25
+        bias = float(np.clip(bias, -1.0, 1.0)) * 0.30
         self.prev_bias = bias
         return bias
 
@@ -230,10 +228,6 @@ class Autopilot:
         self._stuck_timer = 0.0
         self._log_every = 15
 
-        # Smoothing
-        self._steer_ema = 0.0
-        self._steer_alpha = 0.60
-
     def toggle(self):
         self.enabled = not self.enabled
         if not self.enabled:
@@ -241,7 +235,6 @@ class Autopilot:
             self.vc.set_controls(0.0, 0.0)
             self.vc._release_all()
             self.state = "IDLE"
-            self._steer_ema = 0.0
             self._collision_frames = 0
             self._recover_timer = 0
         else:
@@ -249,7 +242,7 @@ class Autopilot:
             self.state = "ACTIVE"
         return self.enabled
 
-    def update(self, raw_bgr, da_seg, ll_seg, coral_dets, gps_crop, gps_info):
+    def update(self, raw_bgr, da_seg, ll_mask, coral_dets, gps_crop, gps_info):
         if not self.enabled:
             return {"state": "DISABLED"}
 
@@ -261,7 +254,7 @@ class Autopilot:
         h, w = raw_bgr.shape[:2]
 
         # ── Perception ──
-        steer_from_lanes, left_y, right_y = self.lane_analyzer.analyze(ll_seg, w, h)
+        steer_from_lanes, left_x, right_x = self.lane_analyzer.analyze(ll_mask, w, h)
         obstacle_risk = self.obstacle_assessor.assess(coral_dets, h, w)
         gps_bias = self.gps_nav.analyze(gps_crop)
 
@@ -271,8 +264,7 @@ class Autopilot:
         else:
             self._collision_frames = max(0, self._collision_frames - 2)
 
-        # Stuck: no lane info + not moving for a while
-        if left_y is None and right_y is None:
+        if left_x is None and right_x is None:
             self._lost_lane_frames += 1
         else:
             self._lost_lane_frames = 0
@@ -293,8 +285,7 @@ class Autopilot:
         elif self._collision_frames > 25 or self._stuck_timer > 3.0:
             print(f"[AP] CRASH/STUCK -> RECOVER")
             self.state = "RECOVER"
-            self._recover_timer = 90  # ~3s
-            self._steer_ema = 0.0
+            self._recover_timer = 90
         elif self.state == "EMERGENCY":
             pass
         elif obstacle_risk > 0.02:
@@ -306,59 +297,52 @@ class Autopilot:
         # ── Steering ──
         steer = steer_from_lanes
 
-        # Blend with GPS when lanes are weak
+        # Fallback to GPS when no lanes detected
         if gps_bias is not None:
-            if left_y is None or right_y is None:
-                alpha = 0.60  # GPS dominates when lanes lost
+            if left_x is None or right_x is None:
+                alpha = 0.70  # GPS dominates when lanes lost
             else:
-                alpha = 0.20  # GPS is gentle nudge
+                alpha = 0.20
             steer = (1.0 - alpha) * steer + alpha * gps_bias
 
         steer = float(np.clip(steer, -1.0, 1.0))
 
-        # EMA smooth steering to avoid jerky inputs
-        self._steer_ema = self._steer_alpha * steer + (1.0 - self._steer_alpha) * self._steer_ema
-        smooth_steer = float(np.clip(self._steer_ema, -1.0, 1.0))
-
         # ── Throttle ──
-        # ETS2 keyboard steering barely works at very low speeds.
-        # We use constant throttle and only reduce for obstacles or curves.
         if self.state == "RECOVER":
             throttle = -1.0
-            smooth_steer = 0.0
+            steer = 0.0
         elif self.state == "EMERGENCY":
             throttle = 0.0
         elif obstacle_risk > 0.85:
-            throttle = 0.0  # coast / engine brake
+            throttle = 0.0
         elif obstacle_risk > 0.40:
-            throttle = 0.35  # slow down
+            throttle = 0.35
         else:
-            # Full throttle on straights, reduce slightly in curves
-            if abs(smooth_steer) > 0.30:
+            if abs(steer) > 0.30:
                 throttle = 0.65
-            elif abs(smooth_steer) > 0.15:
+            elif abs(steer) > 0.15:
                 throttle = 0.80
             else:
                 throttle = 1.0
 
         throttle = float(np.clip(throttle, 0.0, 1.0))
 
-        self.vc.set_controls(smooth_steer, throttle)
+        self.vc.set_controls(steer, throttle)
 
         # Logging
         if self._frame_counter % self._log_every == 0:
-            ly = f"{left_y:.0f}" if left_y else "--"
-            ry = f"{right_y:.0f}" if right_y else "--"
-            print(f"[AP] {self.state:8s} S={smooth_steer:+.2f} T={throttle:.2f} "
-                  f"L={ly} R={ry} obs={obstacle_risk:.2f} gps={gps_bias:+.2f} "
+            lx = f"{left_x}" if left_x else "--"
+            rx = f"{right_x}" if right_x else "--"
+            print(f"[AP] {self.state:8s} S={steer:+.2f} T={throttle:.2f} "
+                  f"L={lx} R={rx} obs={obstacle_risk:.2f} gps={gps_bias:+.2f} "
                   f"keys={self.vc.active_keys}")
 
         self._status_info = {
             "state": self.state,
-            "steering": round(smooth_steer, 2),
+            "steering": round(steer, 2),
             "throttle": round(throttle, 2),
-            "left_y": round(left_y, 1) if left_y else None,
-            "right_y": round(right_y, 1) if right_y else None,
+            "left_x": left_x,
+            "right_x": right_x,
             "obstacle_risk": round(obstacle_risk, 2),
             "gps_bias": round(gps_bias, 2) if gps_bias is not None else None,
             "keys": self.vc.active_keys,
