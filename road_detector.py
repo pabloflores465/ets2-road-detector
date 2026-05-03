@@ -31,6 +31,22 @@ LANE_ALPHA = 1.0
 COLOR_ROAD = np.array([0, 255, 0], dtype=np.uint8)
 COLOR_LANE = np.array([0, 0, 255], dtype=np.uint8)
 
+# Clases BDD100K detectadas por YOLOP
+YOLOP_CLASSES = [
+    "bike", "bus", "car", "motor", "person",
+    "rider", "traffic light", "traffic sign", "train", "truck"
+]
+YOLOP_COLORS = [
+    (255, 0, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0),
+    (128, 255, 0), (0, 128, 255), (255, 128, 0), (0, 255, 128),
+    (128, 0, 255), (255, 255, 255)
+]
+
+# Mostrar deteccion de objetos (obstaculos, coches, senales)
+SHOW_OBJECTS = True
+CONF_THRESHOLD = 0.4
+NMS_IOU_THRESHOLD = 0.5
+
 # Resolucion del modelo. 320 = rapido, 640 = preciso.
 MODEL_RES = 640  # 640 detecta mucho mejor en ETS2
 
@@ -215,6 +231,90 @@ def preprocess(frame_bgr):
     return img, (height, width, r, dw, dh, new_unpad_w, new_unpad_h)
 
 
+def nms(boxes, scores, iou_threshold):
+    """Non-maximum suppression simple en numpy."""
+    if len(boxes) == 0:
+        return []
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    return keep
+
+
+def process_detections(det_out, meta, conf_thresh=0.4, iou_thresh=0.5):
+    """
+    Procesa det_out de YOLOP y retorna lista de detecciones filtradas.
+    Cada deteccion: [x1, y1, x2, y2, conf, cls_id]
+    """
+    height, width, r, dw, dh, new_unpad_w, new_unpad_h = meta
+    det = det_out[0]  # (25200, 6)
+
+    # Filtrar por confianza
+    mask = det[:, 4] > conf_thresh
+    det = det[mask]
+    if len(det) == 0:
+        return []
+
+    boxes = det[:, :4]
+    confs = det[:, 4]
+    clss = det[:, 5].astype(int)
+
+    # Escalar coordenadas al tamano original
+    boxes[:, 0] -= dw
+    boxes[:, 1] -= dh
+    boxes[:, 2] -= dw
+    boxes[:, 3] -= dh
+    boxes[:, :4] /= r
+
+    # Aplicar NMS por clase
+    detections = []
+    unique_classes = np.unique(clss)
+    for cls_id in unique_classes:
+        cls_mask = clss == cls_id
+        cls_boxes = boxes[cls_mask]
+        cls_confs = confs[cls_mask]
+        keep = nms(cls_boxes, cls_confs, iou_thresh)
+        for idx in keep:
+            detections.append([
+                int(cls_boxes[idx][0]), int(cls_boxes[idx][1]),
+                int(cls_boxes[idx][2]), int(cls_boxes[idx][3]),
+                float(cls_confs[idx]), int(cls_id)
+            ])
+    return detections
+
+
+def draw_detections(frame, detections):
+    """Dibuja bounding boxes y etiquetas en el frame."""
+    for x1, y1, x2, y2, conf, cls_id in detections:
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+        color = YOLOP_COLORS[cls_id % len(YOLOP_COLORS)]
+        label = f"{YOLOP_CLASSES[cls_id]} {conf:.2f}"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(frame, (x1, y1 - th - 4), (x1 + tw, y1), color, -1)
+        cv2.putText(frame, label, (x1, y1 - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    return frame
+
+
 def postprocess(da_seg_out, ll_seg_out, meta):
     height, width, r, dw, dh, new_unpad_w, new_unpad_h = meta
     da = da_seg_out[:, :, dh:dh + new_unpad_h, dw:dw + new_unpad_w]
@@ -304,6 +404,7 @@ class OverlayWindow:
         last_ll_mask = None
         last_da_prob = None
         last_ll_prob = None
+        last_detections = []
 
         while self._running:
             loop_start = time.time()
@@ -341,11 +442,16 @@ class OverlayWindow:
                     {"images": inp},
                 )
                 last_da_mask, last_ll_mask, last_da_prob, last_ll_prob = postprocess(da_seg_out, ll_seg_out, meta)
+                if SHOW_OBJECTS:
+                    last_detections = process_detections(det_out, meta, CONF_THRESHOLD, NMS_IOU_THRESHOLD)
+                else:
+                    last_detections = []
 
             da_mask = last_da_mask
             ll_mask = last_ll_mask
             da_prob = last_da_prob
             ll_prob = last_ll_prob
+            detections = last_detections
 
             if da_mask is None:
                 time.sleep(0.05)
@@ -397,6 +503,10 @@ class OverlayWindow:
                 if SHOW_LANES:
                     result[ll_mask == 1] = COLOR_LANE
 
+            # Dibujar detecciones de objetos
+            if SHOW_OBJECTS and detections:
+                result = draw_detections(result, detections)
+
             if np.sum(da_mask) == 0 and np.sum(ll_mask) == 0:
                 cv2.putText(result, "NO DETECTA", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
@@ -412,6 +522,14 @@ class OverlayWindow:
                 frame_count = 0
                 prev_time = now
 
+            obj_count = len(detections)
+            obj_summary = ""
+            if SHOW_OBJECTS and detections:
+                cls_counts = {}
+                for *_, cls_id in detections:
+                    cls_counts[YOLOP_CLASSES[cls_id]] = cls_counts.get(YOLOP_CLASSES[cls_id], 0) + 1
+                obj_summary = ", ".join([f"{n}:{c}" for n, c in cls_counts.items()])
+
             with self._lock:
                 self.frame_result = result
                 self.fps = fps_display
@@ -419,6 +537,8 @@ class OverlayWindow:
                 self.lane_pixels = int(np.sum(ll_mask))
                 self.da_max = da_max
                 self.ll_max = ll_max
+                self.obj_count = obj_count
+                self.obj_summary = obj_summary
 
             elapsed = time.time() - loop_start
             sleep_time = max(0, (1.0 / FPS_LIMIT) - elapsed)
@@ -458,7 +578,11 @@ class OverlayWindow:
             lane_pixels = getattr(self, 'lane_pixels', 0)
             da_max = getattr(self, 'da_max', 0.0)
             ll_max = getattr(self, 'll_max', 0.0)
-            info_text = f"FPS:{fps} | road:{road_pixels}px | da:{da_max:.2f} | ll:{ll_max:.2f}"
+            obj_count = getattr(self, 'obj_count', 0)
+            obj_summary = getattr(self, 'obj_summary', "")
+            info_text = f"FPS:{fps} | objs:{obj_count}"
+            if obj_summary:
+                info_text += f" | {obj_summary}"
             self.lbl_info.configure(text=info_text)
             self.lbl_info.place(x=0, y=new_h, width=new_w, height=18)
 
