@@ -371,6 +371,9 @@ class Autopilot:
         steer = float(np.clip(steer, -1.0, 1.0))
 
         # ── Longitudinal Control ──
+        speed_error = target - current_speed
+        throttle = self.kp_speed * speed_error
+
         if self.state == "RECOVER":
             # Reverse straight out
             throttle = -1.0
@@ -382,9 +385,6 @@ class Autopilot:
             throttle = -1.0
         elif closest_obstacle > 0.65 and speed_error > 0:
             throttle = min(throttle, 0.0)
-        else:
-            speed_error = target - current_speed
-            throttle = self.kp_speed * speed_error
 
         throttle = float(np.clip(throttle, -1.0, 1.0))
 
