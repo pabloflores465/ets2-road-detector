@@ -236,6 +236,9 @@ class NavOverlayManager:
         self.right_img = None
         self.gps_info = {}
         self.fps = 0
+        # Exposed for autopilot (thread-safe read via _lock)
+        self.last_gps_crop = None
+        self.last_gps_info = {}
 
         self._tk_gps = None
         self._tk_left = None
@@ -292,6 +295,8 @@ class NavOverlayManager:
                     self.right_img = right_frame
                 self.gps_info = gps_info
                 self.fps = fps_display
+                self.last_gps_crop = gps_frame.copy() if gps_frame is not None else None
+                self.last_gps_info = dict(gps_info)
 
             elapsed = time.time() - loop_start
             sleep_time = max(0, (1.0 / FPS_LIMIT) - elapsed)

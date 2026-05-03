@@ -5,3 +5,4 @@ Pillow
 onnxruntime
 pyobjc-framework-Quartz
 pyobjc-framework-ApplicationServices
+pynput

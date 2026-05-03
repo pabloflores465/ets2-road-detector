@@ -21,6 +21,7 @@ from PIL import Image, ImageTk
 
 from ets2_capture import find_ets2_window, capture_window_quartz, capture_fallback, select_region_manual
 from nav_overlay import NavOverlayManager
+from autopilot import Autopilot
 
 # -----------------------------------------------------------------------------
 # CONFIGURACION
@@ -278,6 +279,10 @@ class MainWindow:
         self._win_lock = threading.Lock()
         self._running = True
         self._display_mode = DISPLAY_MODE
+        self.nav_win = None
+
+        # Autopilot
+        self.autopilot = Autopilot()
 
         # Frame principal
         self.frame = tk.Frame(root, bg="black")
@@ -289,6 +294,13 @@ class MainWindow:
             bd=0, padx=5, pady=1, cursor="hand2"
         )
         self.btn_close.place(x=0, y=0)
+
+        self.btn_ap = Button(
+            self.frame, text="AP:OFF", command=self._toggle_ap,
+            bg="#333333", fg="#ffaa00", font=("Arial", 8, "bold"),
+            bd=0, padx=4, pady=1, cursor="hand2"
+        )
+        self.btn_ap.place(x=24, y=0)
 
         self.lbl_main = Label(self.frame, bg="black", bd=0)
         self.lbl_main.place(x=0, y=0)
@@ -313,6 +325,31 @@ class MainWindow:
 
         self._schedule_update()
 
+    def set_nav_overlay(self, nav_win):
+        self.nav_win = nav_win
+
+    def _toggle_ap(self):
+        enabled = self.autopilot.toggle()
+        self.btn_ap.configure(text=f"AP:{'ON' if enabled else 'OFF'}",
+                              bg="#00aa00" if enabled else "#333333")
+
+    def _normalize_dets(self, dets):
+        """Convert detections to (x1, y1, x2, y2, label, score) for autopilot."""
+        out = []
+        for d in dets:
+            if len(d) != 6:
+                continue
+            if isinstance(d[5], str):
+                # Coral: [x1, y1, x2, y2, score, label]
+                x1, y1, x2, y2, score, label = d
+                out.append((x1, y1, x2, y2, label, score))
+            else:
+                # YOLOP: [x1, y1, x2, y2, score, cls_id]
+                x1, y1, x2, y2, score, cls_id = d
+                label = YOLOP_CLASSES[int(cls_id)] if int(cls_id) < len(YOLOP_CLASSES) else f"id:{cls_id}"
+                out.append((x1, y1, x2, y2, label, score))
+        return out
+
     def _start_move(self, event):
         self._drag_x = event.x
         self._drag_y = event.y
@@ -328,6 +365,7 @@ class MainWindow:
         fps_display = 0
         skip_counter = 0
         last_da_mask = last_ll_mask = last_da_prob = last_ll_prob = None
+        last_da_seg = last_ll_seg = None
         last_objs = []
 
         while self._running:
@@ -355,6 +393,8 @@ class MainWindow:
                     ["det_out", "drive_area_seg", "lane_line_seg"],
                     {"images": inp},
                 )
+                last_da_seg = da_seg_out
+                last_ll_seg = ll_seg_out
                 last_da_mask, last_ll_mask, last_da_prob, last_ll_prob = postprocess(da_seg_out, ll_seg_out, meta)
                 if self.use_coral:
                     last_objs = coral_infer(self.coral_interpreter, self.coral_detect_mod, frame_bgr, self.coral_labels, CORAL_CONF)
@@ -367,6 +407,8 @@ class MainWindow:
             ll_mask = last_ll_mask
             da_prob = last_da_prob
             ll_prob = last_ll_prob
+            da_seg_out = last_da_seg
+            ll_seg_out = last_ll_seg
             objs = last_objs
 
             if da_mask is None:
@@ -411,6 +453,39 @@ class MainWindow:
 
             if np.sum(da_mask) == 0 and np.sum(ll_mask) == 0:
                 cv2.putText(result, "NO DETECTA", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+            # --- Autopilot update ---
+            ap_status = None
+            if self.autopilot.enabled:
+                gps_crop = None
+                gps_info = {}
+                if self.nav_win is not None:
+                    try:
+                        gps_crop = self.nav_win.last_gps_crop
+                        gps_info = self.nav_win.last_gps_info
+                    except Exception:
+                        pass
+                ap_dets = self._normalize_dets(objs)
+                ap_status = self.autopilot.update(
+                    frame_bgr,
+                    da_seg_out if da_seg_out is not None else np.zeros((1, 2, MODEL_RES, MODEL_RES), dtype=np.float32),
+                    ll_seg_out if ll_seg_out is not None else np.zeros((1, 2, MODEL_RES, MODEL_RES), dtype=np.float32),
+                    ap_dets, gps_crop, gps_info
+                )
+
+                # Draw AP HUD
+                ap_state = ap_status.get("state", "?")
+                ap_steer = ap_status.get("steering", 0)
+                ap_thr = ap_status.get("throttle", 0)
+                ap_tgt = ap_status.get("target_speed", 0)
+                hud = f"AP {ap_state} S:{ap_steer:+.2f} T:{ap_thr:+.2f} Vtgt:{ap_tgt:.0f}"
+                cv2.putText(result, hud, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+                # Visual lane center guide
+                lc = ap_status.get("lane_center")
+                if lc is not None:
+                    cv2.circle(result, (int(lc), h - 20), 8, (0, 255, 0), 2)
+                    cv2.line(result, (w // 2, h - 20), (int(lc), h - 20), (0, 255, 0), 2)
 
             da_max = float(np.max(da_prob)) if da_prob is not None else 0.0
             ll_max = float(np.max(ll_prob)) if ll_prob is not None else 0.0
@@ -465,7 +540,11 @@ class MainWindow:
             self.lbl_main.configure(image=imgtk)
             self.lbl_main.place(x=0, y=0, width=new_w, height=new_h)
 
-            info_text = f"FPS:{fps} | {backend} | objs:{obj_count}"
+            ap_text = ""
+            if self.autopilot.enabled and self.autopilot.status:
+                s = self.autopilot.status
+                ap_text = f" | AP:{s.get('state','?')} S:{s.get('steering',0):+.2f}"
+            info_text = f"FPS:{fps} | {backend} | objs:{obj_count}{ap_text}"
             self.lbl_info.configure(text=info_text)
             self.lbl_info.place(x=0, y=new_h, width=new_w, height=18)
             self.root.geometry(f"{new_w}x{new_h + 18}")
@@ -475,6 +554,7 @@ class MainWindow:
 
     def on_close(self):
         self._running = False
+        self.autopilot.shutdown()
         self.root.destroy()
 
 
@@ -536,11 +616,14 @@ def main():
     nav_root.geometry("400x300+800+100")
 
     nav_win = NavOverlayManager(nav_root, win_info)
+    main_win.set_nav_overlay(nav_win)
 
     try:
         root.mainloop()
     except KeyboardInterrupt:
         pass
+    finally:
+        main_win.autopilot.shutdown()
 
     print("[INFO] Cerrado.")
 
